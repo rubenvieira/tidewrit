@@ -1,5 +1,5 @@
 import { SandSound } from './audio/sound'
-import { SAND, idleStroke } from './config'
+import { DIG, POUR, SAND, WATER, idleStroke } from './config'
 import { InputController } from './input/controller'
 import type { BootMonitor } from './platform/boot'
 import { createGpu } from './platform/gpu'
@@ -7,8 +7,10 @@ import { WaveResetEffect } from './reset/effect'
 import { waveResetViewport } from './reset/viewport'
 import { useMobileGrainFiltering, useSingleFrameResetPacing } from './platform/mobile'
 import { drawingBuffer } from './platform/viewport'
+import { ImageExport, deliverImage } from './render/image-export'
 import { SandRenderer } from './render/renderer'
 import { FixedClock } from './simulation/clock'
+import { SandHistory } from './simulation/history'
 import { SandSolver } from './simulation/solver'
 import type { InterfaceElements } from './ui/interface'
 
@@ -16,6 +18,8 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
   const gpu = await createGpu(ui.canvas, monitor)
   const solver = new SandSolver(gpu.device)
   const renderer = new SandRenderer(gpu.device, solver, gpu.format, useMobileGrainFiltering())
+  const history = new SandHistory(gpu.device, solver)
+  const imageExport = new ImageExport(gpu.device, gpu.format)
   const sound = new SandSound()
   const soundReady = sound.prepare()
   const clock = new FixedClock(SAND.step, SAND.maxSteps)
@@ -31,10 +35,20 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
   const singleFrameResetPacing = useSingleFrameResetPacing()
   const resetFrameBudget = singleFrameResetPacing ? 1 : 2
   const waveReset = new WaveResetEffect()
+  let toolbarInteractive = false
+  let saving = false
+  const syncHistoryButtons = () => {
+    ui.undo.disabled = !toolbarInteractive || !history.canUndo
+    ui.redo.disabled = !toolbarInteractive || !history.canRedo
+  }
   const setToolbarInteractive = (interactive: boolean) => {
+    toolbarInteractive = interactive
     ui.reset.disabled = !interactive
     ui.radius.disabled = !interactive
+    for (const button of [...ui.tools, ui.symmetry, ui.zen, ui.write, ui.material, ui.light]) button.disabled = !interactive
+    if (!interactive) { ui.writer.hidden = true; ui.write.setAttribute('aria-expanded', 'false') }
     input?.setInteractive(interactive)
+    syncHistoryButtons()
   }
 
   const stop = () => {
@@ -44,7 +58,7 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
     listeners.abort()
     input?.dispose()
     sound.dispose()
-    renderer.dispose(); solver.dispose(); gpu.dispose()
+    history.dispose(); renderer.dispose(); solver.dispose(); gpu.dispose()
   }
   monitor.setStop(stop)
   const resize = () => {
@@ -58,6 +72,7 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
   try {
     monitor.stage('Initializing sand transport')
     await solver.initialize()
+    await history.initialize()
     monitor.stage('Compiling granular lighting')
     await renderer.initialize()
     monitor.stage('Rendering the first surface')
@@ -83,8 +98,22 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
       if (framesInFlight >= frameBudget) return
       try {
         resize()
+        const encoder = gpu.device.createCommandEncoder()
+        const activeInput = input!
+        let exportImage = false
+        if (!waveResetInteractive) {
+          for (const action of activeInput.takeActions()) {
+            if (action === 'capture') history.capture(encoder)
+            else if (action === 'undo') history.undo(encoder)
+            else if (action === 'redo') history.redo(encoder)
+            else if (action === 'save') exportImage = !saving
+          }
+        }
         if (resetPending && !waveResetInteractive) {
           resetPending = false
+          // "Start again" is itself undoable.
+          history.capture(encoder)
+          activeInput.autopilot.stop()
           waveResetInteractive = true
           sound.cancelAll()
           waveReset.start(now, sound.playResetWave(), waveResetViewport(renderer.camera))
@@ -92,8 +121,6 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
           clock.reset()
           setToolbarInteractive(false)
         }
-        const encoder = gpu.device.createCommandEncoder()
-        const activeInput = input!
         const waveState = waveReset.update(now)
         if (waveResetInteractive) {
           clock.reset()
@@ -111,10 +138,42 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
             setToolbarInteractive(true)
           }
         }
+        if (!waveResetInteractive) {
+          activeInput.autopilot.update(now)
+          const water = activeInput.water.takeLanded(now, WATER.maxDropsPerFrame)
+          solver.encodeDeposits(encoder, [...water, ...activeInput.pourer.take(now, WATER.maxDropsPerFrame - water.length)])
+          for (const splash of activeInput.water.takeSplashes(now)) sound.playSplash(splash.intensity)
+          if (activeInput.pourer.takeDrips().length) sound.playSplash(0.07)
+          const earthworks = activeInput.earthworks.take(now)
+          solver.encodeEarthworks(encoder, earthworks.digs, earthworks.molds)
+          for (const thud of activeInput.earthworks.takeThuds()) sound.playThud(thud)
+        }
+        // Thrown spoil falls through the same grain stream as poured sand.
+        const streams = waveResetInteractive ? [] : [...activeInput.pourer.emitters(), ...activeInput.earthworks.spoilEmitters()]
+        const streamRadius = activeInput.pourer.pouring ? activeInput.pourer.size * POUR.streamRadius : activeInput.earthworks.size * DIG.spoilRadius
+        solver.setPour(streams, streamRadius)
+        const zenActive = String(activeInput.autopilot.active)
+        if (ui.zen.getAttribute('aria-pressed') !== zenActive) ui.zen.setAttribute('aria-pressed', zenActive)
+        syncHistoryButtons()
         const count = waveResetInteractive ? 0 : clock.advance(now)
         if (count > 0) solver.encode(encoder, Array.from({ length: count }, () => activeInput.strokes.nextBatch()))
-        renderer.encode(encoder, gpu.context.getCurrentTexture().createView(), activeInput.strokes.cursor, now, activeInput.showPointer, waveState)
+        renderer.setDaylight(activeInput.daylight.sample(now))
+        renderer.setMaterial(activeInput.material)
+        solver.setKinetic(activeInput.material.kinetic)
+        const preview = activeInput.preview()
+        renderer.encode(encoder, gpu.context.getCurrentTexture().createView(), preview.cursor, now, preview.visible, waveState, preview.tool)
+        const finishExport = exportImage
+          ? imageExport.encode(encoder, ui.canvas.width, ui.canvas.height, (target) => renderer.encode(encoder, target, idleStroke(), now, false, waveState))
+          : undefined
         gpu.device.queue.submit([encoder.finish()])
+        if (finishExport) {
+          saving = true
+          ui.save.disabled = true
+          void finishExport().then(deliverImage).catch((error: unknown) => console.error('[Sandboard] Image export failed', error)).finally(() => {
+            saving = false
+            ui.save.disabled = false
+          })
+        }
         framesInFlight++
         void gpu.device.queue.onSubmittedWorkDone().then(() => {
           framesInFlight = Math.max(0, framesInFlight - 1)

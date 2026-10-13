@@ -40,12 +40,15 @@ test('surface and loose-grain fragments provide the dedicated glint target', () 
 })
 
 test('mobile grain filtering preserves full visible material detail', () => {
-  const mobileFragment = surfaceShader.match(/@fragment fn fragmentMobile[\s\S]*?(?=struct GrainOutput)/)?.[0]
-  expect(mobileFragment).toBeDefined()
-  expect(mobileFragment).toContain('let appearanceDetail = 1.0;')
-  expect(mobileFragment).toContain('let depthDetail = 1.0 - smoothstep(0.48, 0.90, footprint);')
-  expect(mobileFragment).toContain('let stochasticAmount = smoothstep(0.32, 0.58, footprint);')
-  expect(mobileFragment).not.toContain('let detail = 1.0 - smoothstep(0.55, 2.1, footprint);')
+  // The phone path is the mobile branch of the shared surface shading, applied
+  // to whichever grain projection plane a pixel uses.
+  expect(surfaceShader).toMatch(/@fragment fn fragmentMobile[\s\S]*?shadeSurface\([^;]*, true\)/)
+  const mobileBranch = surfaceShader.match(/if \(mobile\) \{[\s\S]*?\n {2}\}/)?.[0]
+  expect(mobileBranch).toBeDefined()
+  expect(mobileBranch).toContain('appearanceDetail = 1.0;')
+  expect(mobileBranch).toContain('depthDetail = 1.0 - smoothstep(0.48, 0.90, footprint);')
+  expect(mobileBranch).toContain('let stochasticAmount = smoothstep(0.32, 0.58, footprint);')
+  expect(mobileBranch).not.toContain('smoothstep(0.55, 2.1, footprint)')
 })
 
 

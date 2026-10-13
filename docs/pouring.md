@@ -1,0 +1,9 @@
+# Pouring and dripping
+
+Pour and drip add new sand through the same deposit pass as water (`water.md`); they are the only tools that change the bed's total volume. Each deposit adds a Gaussian mound whose volume is exactly `sand · π · radius² / 4`, so the pour rate is a volume per second (1e-5 m³/s at the default size, scaling with size²), independent of frame rate. The GPU test checks the poured volume to 1%.
+
+**Pour** lands a stream deposit under each held pointer every frame. Shape comes entirely from the existing transport: a still pointer grows a cone that avalanches at the angle of repose (eight-neighbor transport makes it slightly octagonal), and a moving pointer lays a sand line. The visible stream is light grains spawned by the particle shader up to 8 cm above each emitter, falling under gravity with drag. They carry only about 1 mg-equivalent each (well under 1% of the poured volume), so the visual never competes with the deposit for mass. Emitters (at most 8, after symmetry) and a per-inactive-grain spawn chance are passed in a `pour` array in the simulation parameters. The chance is sized for about 40 grains per substep per emitter.
+
+**Drip** releases slurry blobs at 7 per second, each 2.5e-7 m³ at the default size (scaling with size³), scattered by up to a third of a blob radius. Drips carry moisture just past saturation (1.05). Soaked slurry was tried first: it is the least cohesive state, so each drip flattened the top before it could set and the result was a flat-topped block. Just past saturation, a drip slumps slightly and its film drains within steps, leaving damp sand that stands vertical faces, so drips stack into lumpy towers. The GPU test checks that ten wet drips stand at least 2 mm taller than the same sand dropped dry.
+
+A heightfield at 1.56 mm cells cannot hold overhangs or delicate spires; drip castles read as stacked lumpy mounds.

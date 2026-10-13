@@ -1,5 +1,26 @@
-import { SAND } from '../config'
+import { KINETIC, POUR, SAND, WATER } from '../config'
 import { fluxLayout } from './flux'
+import { toolFootprints } from './footprints'
+import { bedReliefWgsl } from './bed-relief'
+
+// Cohesion is a height, not a steeper angle: a cohesive material stands as a
+// vertical face up to a critical height set by its strength, as a damp
+// sandcastle wall or a cut through kinetic sand does, and only taller faces
+// fail. A slope multiplier could not hold a knife cut one cell wide. Damp
+// sand's capillary bridges give it that strength; past saturation they flood
+// and it slumps like a slurry. Wet grains stick together, so moisture also
+// suppresses spray. Kinetic sand's strength comes from how packed it is.
+const moistureResponse = `
+fn wetHold(wetness: f32) -> f32 {
+  return ${WATER.dampHold} * smoothstep(0.04, 0.4, wetness) * (1.0 - smoothstep(0.9, 1.3, wetness));
+}
+fn looseness(wetness: f32) -> f32 {
+  return 1.0 - smoothstep(0.08, 0.6, wetness);
+}
+fn kineticHold(packed: f32) -> f32 {
+  return mix(${KINETIC.looseHold}, ${KINETIC.packedHold}, clamp(packed, 0.0, 1.0));
+}
+`
 
 const paramsLayout = `
 struct ToolContact {
@@ -7,11 +28,21 @@ struct ToolContact {
   end: vec4f,
   motion: vec4f,
 }
+// tool = (contact count, indentation, rate, pour emitter count);
+// material = (kinetic flag, creep fraction per substep, -, -);
+// pour[i] = (x, y, stream radius, spawn chance per inactive grain).
 struct Params {
   grid: vec4f,
   physics: vec4f,
   tool: vec4f,
+  material: vec4f,
+  pour: array<vec4f, ${POUR.maxEmitters}>,
   contacts: array<ToolContact, ${SAND.maxContacts}>,
+}
+`
+const ledgerLayout = `
+fn impactSlot(cell: u32) -> u32 {
+  return cell + u32(params.grid.x * params.grid.x);
 }
 `
 
@@ -19,13 +50,17 @@ export const simulationShader = `
 ${fluxLayout}
 ${paramsLayout}
 @group(0) @binding(0) var<uniform> params: Params;
+${ledgerLayout}
 @group(0) @binding(1) var<storage, read> source: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> destination: array<vec4f>;
 @group(0) @binding(3) var<storage, read_write> flux: array<Flux>;
-@group(0) @binding(4) var<storage, read_write> exchange: array<atomic<i32>>;
+// Fixed-point ledger: grain exchange in the first grid-sized half, the
+// frontier impact ejection budget in the second.
+@group(0) @binding(4) var<storage, read_write> ledger: array<atomic<i32>>;
 @group(0) @binding(5) var<storage, read_write> contactField: array<vec4f>;
 @group(0) @binding(6) var<storage, read_write> contactPressure: array<f32>;
-@group(0) @binding(7) var<storage, read_write> impactBudget: array<atomic<i32>>;
+@group(0) @binding(7) var<storage, read> packing: array<f32>;
+@group(0) @binding(8) var<storage, read> moisture: array<f32>;
 
 fn hash(position: vec2f) -> f32 {
   return fract(sin(dot(position, vec2f(127.1, 311.7))) * 43758.5453);
@@ -41,6 +76,15 @@ struct ContactSample {
   field: vec4f,
   pressure: f32,
 }
+fn strokeFrame(tool: ToolContact) -> vec2f {
+  let segment = tool.end.xy - tool.start.xy;
+  let segmentLength = length(segment);
+  if (segmentLength > 1e-7) { return segment / segmentLength; }
+  let speed = length(tool.motion.xy);
+  return select(vec2f(1.0, 0.0), tool.motion.xy / max(speed, 1e-8), speed > 1e-6);
+}
+${toolFootprints}
+${bedReliefWgsl}
 fn sampleTool(position: vec2f) -> ContactSample {
   var strongest = 0.0;
   var coverage = 0.0;
@@ -53,9 +97,11 @@ fn sampleTool(position: vec2f) -> ContactSample {
     let segment = tool.end.xy - tool.start.xy;
     let along = clamp(dot(position - tool.start.xy, segment) / max(dot(segment, segment), 1e-10), 0.0, 1.0);
     let offset = position - tool.start.xy - along * segment;
-    let distance = length(offset) / max(tool.start.z, 1e-7);
-    let envelope = max(0.0, 1.0 - distance * distance);
-    let localCoverage = envelope * envelope;
+    // Cheap reject outside the swept reach before any shape work.
+    if (dot(offset, offset) > tool.start.z * tool.start.z * 2.5) { continue; }
+    let footprint = toolFootprint(u32(tool.end.z + 0.5), offset, position, strokeFrame(tool), tool.end.w, tool.motion.w, tool.start.z);
+    let distance = footprint.x;
+    let localCoverage = footprint.y;
     let strength = localCoverage * tool.start.w;
     shell = max(shell, 1.0 - smoothstep(0.9, 1.55, distance));
     if (strength > strongest) {
@@ -78,6 +124,7 @@ fn pressureAt(cell: vec2i) -> f32 {
 fn impactResponse(speed: f32) -> f32 {
   return smoothstep(${SAND.impactSpeedStart}, ${SAND.impactSpeedFull}, speed);
 }
+${moistureResponse}
 fn impactCore(contact: vec4f, pressure: f32) -> f32 {
   return impactResponse(length(contact.zw)) * pressure * pow(contact.x, 1.75);
 }
@@ -89,8 +136,7 @@ fn initialize(@builtin(global_invocation_id) invocation: vec3u) {
   if (any(invocation.xy >= vec2u(u32(params.grid.x)))) { return; }
   let cell = vec2i(invocation.xy);
   let position = location(cell);
-  let height = params.physics.x + 0.00015 * (hash(vec2f(cell)) - 0.5)
-    + 0.0004 * sin(position.x * 31.0 + sin(position.y * 23.0)) * sin(position.y * 27.0);
+  let height = params.physics.x + bedRelief(position);
   destination[address(cell)] = vec4f(height, 0.0, 0.0, 0.0);
 }
 @compute @workgroup_size(8, 8)
@@ -116,6 +162,9 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
   let speedResponse = toolSpeed / (toolSpeed + 0.35);
   let impact = impactCore(toolContact, toolPressure);
   let centerShell = toolContact.y;
+  let centerMoisture = moisture[address(cell)];
+  let centerPacking = packing[address(cell)];
+  let kinetic = params.material.x > 0.5;
   var outgoing = Flux(vec4f(0.0), vec4f(0.0));
   var escape = Flux(vec4f(0.0), vec4f(0.0));
   var coverageGradient = vec2f(0.0);
@@ -129,6 +178,8 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
     if (axis == 2u) { coverageGradient += vec2f(0.0, -otherContact.x * 0.5); }
     if (axis == 3u) { coverageGradient += vec2f(0.0, otherContact.x * 0.5); }
     let otherPenetration = penetrationFor(otherContact, pressureAt(neighbor));
+    // Beach sand is held by water; kinetic sand by how packed it is.
+    let hold = select(wetHold(0.5 * (centerMoisture + moisture[address(neighbor)])), kineticHold(0.5 * (centerPacking + packing[address(neighbor)])), kinetic);
     let friction = mix(params.physics.z, params.physics.w, clamp(max(center.y, other.y) * 35.0, 0.0, 1.0));
     let linkLength = select(1.0, 1.41421356, axis >= 4u);
     let weight = select(0.66666667, 0.16666667, axis >= 4u);
@@ -138,14 +189,31 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
     let contactYield = max(toolContact.x, otherContact.x);
     let disturbedShell = max(centerShell, neighborShell);
     let thresholdScale = min(mix(1.0, 0.08, contactYield), mix(1.0, 0.45, disturbedShell));
-    let threshold = friction * params.grid.y * linkLength * thresholdScale;
+    // A tool's core breaks the bonds it passes through: a bond fails only when
+    // both of its cells are cut, so the faces a cut leaves keep their full
+    // strength and displaced sand is pushed outward instead of pouring back.
+    let severed = smoothstep(0.5, 0.9, min(toolContact.x, otherContact.x));
+    // The holding height limits a whole face, not each cell step: looking one
+    // cell further down the link, a drop that already exceeds it is a taller
+    // face (or a staircase) and loses its cohesive support, so it slumps until
+    // no face is taller than the material can stand.
+    let beyond = source[address(neighbor + neighbors[axis])].x;
+    let relief = center.x - min(other.x, beyond);
+    let face = 1.0 - smoothstep(hold, hold * 2.0 + 1e-6, relief);
+    let threshold = friction * params.grid.y * linkLength * thresholdScale + hold * face * (1.0 - severed);
     let excess = max(0.0, effectiveHeight - other.x - otherPenetration - threshold);
     let physicalThreshold = friction * params.grid.y * linkLength * mix(1.0, 0.45, disturbedShell);
     let physicalExcess = max(0.0, center.x - other.x - physicalThreshold);
-    let supercritical = smoothstep(params.grid.y * 1.5, params.grid.y * 5.0, physicalExcess);
+    // Kinetic sand never avalanches; it creeps (below).
+    let supercritical = select(smoothstep(params.grid.y * 1.5, params.grid.y * 5.0, physicalExcess), 0.0, kinetic);
     let avalancheBoost = 1.0 + supercritical * mix(0.35, 0.85, max(contactYield, disturbedShell));
     var amount = excess * params.grid.w * params.tool.z * weight * avalancheBoost;
     amount *= 1.0 + toolContact.x * speedResponse * forward * 0.55 + impact * forward * 0.95;
+    if (kinetic) {
+      // Slow viscous creep of everything steeper than dry sand's repose.
+      let creepExcess = max(0.0, center.x - other.x - params.physics.z * params.grid.y * linkLength);
+      amount += creepExcess * params.material.y * weight;
+    }
     let edge = max(0.0, penetration - otherPenetration) / max(penetration, 1e-7);
     let sideways = toolContact.x * (1.0 - abs(dot(axisDirection, motionDirection))) * 0.06;
     let escapeWeight = (edge + sideways) * (1.0 + speedResponse * forward * 0.8 + impact * forward * 1.35) * weight;
@@ -174,8 +242,10 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
   let limited = Flux(outgoing.axial * limiter, outgoing.diagonal * limiter);
   flux[address(cell)] = limited;
   let remaining = max(0.0, center.x - params.physics.y - totalFlux(limited));
-  let desiredEjection = totalFlux(limited) * ${SAND.impactEjectionFraction} * impact * clamp(frontier * 1.4, 0.0, 1.0);
-  atomicStore(&impactBudget[address(cell)], i32(round(min(remaining, desiredEjection) * 1e9)));
+  // Kinetic sand sheds half as much, as heavier crumbs (see the grain shader).
+  let shedding = select(looseness(centerMoisture), 0.5, kinetic);
+  let desiredEjection = totalFlux(limited) * ${SAND.impactEjectionFraction} * impact * clamp(frontier * 1.4, 0.0, 1.0) * shedding;
+  atomicStore(&ledger[impactSlot(address(cell))], i32(round(min(remaining, desiredEjection) * 1e9)));
 }
 @compute @workgroup_size(8, 8)
 fn integrate(@builtin(global_invocation_id) invocation: vec3u) {
@@ -192,7 +262,7 @@ fn integrate(@builtin(global_invocation_id) invocation: vec3u) {
     if (axis < 4u) { incoming.axial[axis] = amount; }
     else { incoming.diagonal[axis - 4u] = amount; }
   }
-  let transferred = f32(atomicExchange(&exchange[index], 0)) * 1e-9;
+  let transferred = f32(atomicExchange(&ledger[index], 0)) * 1e-9;
   let height = current.x + totalFlux(incoming) - totalFlux(outgoing) + transferred;
   let moved = totalFlux(incoming) + totalFlux(outgoing);
   let toolContact = contactAt(cell);
@@ -213,13 +283,15 @@ ${fluxLayout}
 ${paramsLayout}
 struct Grain { position: vec4f, velocity: vec4f }
 @group(0) @binding(0) var<uniform> params: Params;
+${ledgerLayout}
 @group(0) @binding(1) var<storage, read> bed: array<vec4f>;
 @group(0) @binding(2) var<storage, read> flux: array<Flux>;
 @group(0) @binding(3) var<storage, read_write> grains: array<Grain>;
-@group(0) @binding(4) var<storage, read_write> exchange: array<atomic<i32>>;
+@group(0) @binding(4) var<storage, read_write> ledger: array<atomic<i32>>;
 @group(0) @binding(5) var<storage, read> contactField: array<vec4f>;
 @group(0) @binding(6) var<storage, read> contactPressure: array<f32>;
-@group(0) @binding(7) var<storage, read_write> impactBudget: array<atomic<i32>>;
+@group(0) @binding(8) var<storage, read> moisture: array<f32>;
+${moistureResponse}
 fn random(seed: u32) -> f32 {
   var value = seed * 747796405u + 2891336453u;
   value = ((value >> ((value >> 28u) + 4u)) ^ value) * 277803737u;
@@ -235,13 +307,13 @@ fn impactResponse(speed: f32) -> f32 {
 }
 fn claimImpactMass(cell: u32, requestedMass: f32) -> f32 {
   let requestedUnits = max(1, i32(round(requestedMass * 1e9)));
-  let previous = atomicSub(&impactBudget[cell], requestedUnits);
+  let previous = atomicSub(&ledger[impactSlot(cell)], requestedUnits);
   if (previous <= 0) {
-    atomicAdd(&impactBudget[cell], requestedUnits);
+    atomicAdd(&ledger[impactSlot(cell)], requestedUnits);
     return 0.0;
   }
   let claimed = min(previous, requestedUnits);
-  if (claimed < requestedUnits) { atomicAdd(&impactBudget[cell], requestedUnits - claimed); }
+  if (claimed < requestedUnits) { atomicAdd(&ledger[impactSlot(cell)], requestedUnits - claimed); }
   return f32(claimed) * 1e-9;
 }
 fn cellCenter(cell: u32) -> vec2f {
@@ -299,7 +371,7 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
         let friction = max(0.0, 1.0 - params.physics.w * 1.22 * abs(normalSpeed) / max(length(tangent), 1e-7));
         grain.velocity = vec4f(tangent * friction - normal * normalSpeed * 0.22, grain.velocity.w);
       } else {
-        atomicAdd(&exchange[cell], i32(round(grain.position.w * 1e9)));
+        atomicAdd(&ledger[cell], i32(round(grain.position.w * 1e9)));
         grain.position.w = 0.0;
         grain.velocity.w = 0.0;
       }
@@ -308,8 +380,23 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
     grain.velocity.w += 1.0;
     let seed = index * 991u + u32(grain.velocity.w);
     var launched = false;
+    // Pouring: a thin stream of grains released above each emitter. The bulk
+    // of the poured volume lands through the deposit pass; these light grains
+    // are the visible stream and add only their own small mass where they land.
+    let pourCount = u32(params.tool.w);
+    if (pourCount > 0u && random(seed + 97u) < params.pour[0].w) {
+      let emitter = params.pour[index % pourCount];
+      let spread = sqrt(random(seed + 101u)) * emitter.z * 0.35;
+      let around = random(seed + 103u) * 6.28318531;
+      let origin = emitter.xy + vec2f(cos(around), sin(around)) * spread;
+      let surface = contactAt(origin);
+      let mass = mix(0.0000006, 0.0000014, random(seed + 107u));
+      grain.position = vec4f(origin.x, surface.x + 0.06 + random(seed + 109u) * 0.02, origin.y, mass);
+      grain.velocity = vec4f((random(seed + 113u) - 0.5) * 0.05, -0.5 - random(seed + 127u) * 0.25, (random(seed + 131u) - 0.5) * 0.05, -1e-6);
+      launched = true;
+    }
     let contactCount = u32(params.tool.x);
-    if (contactCount > 0u) {
+    if (!launched && contactCount > 0u) {
       let contactIndex = index % contactCount;
       let tool = params.contacts[contactIndex];
       let toolSpeed = length(tool.motion.xy);
@@ -329,7 +416,8 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
         let localContact = contactField[cell];
         let localSpeed = length(localContact.zw);
         let localImpact = impactResponse(localSpeed) * contactPressure[cell] * pow(localContact.x, 1.75);
-        let requestedMass = mix(${SAND.impactParticleMassMin}, ${SAND.impactParticleMassMax}, random(seed + 13u));
+        let kinetic = params.material.x > 0.5;
+        let requestedMass = mix(${SAND.impactParticleMassMin}, ${SAND.impactParticleMassMax}, random(seed + 13u)) * select(1.0, ${KINETIC.crumbMass.toFixed(1)}, kinetic);
         var mass = 0.0;
         if (localImpact > 0.0) { mass = claimImpactMass(cell, requestedMass); }
         if (mass > 0.0) {
@@ -341,15 +429,16 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
           let launchDirection = normalize(motionDirection + transportDirection * 0.28);
           let launchSide = vec2f(-launchDirection.y, launchDirection.x);
           let spread = (random(seed + 31u) - 0.5) * localSpeed * 0.26;
-          let horizontalSpeed = localSpeed * (0.42 + random(seed + 5u) * 0.38);
+          let crumb = select(1.0, ${KINETIC.crumbSpeed.toFixed(3)}, kinetic);
+          let horizontalSpeed = localSpeed * (0.42 + random(seed + 5u) * 0.38) * crumb;
           let horizontal = launchDirection * horizontalSpeed + launchSide * spread;
           let uphill = max(0.0, dot(surface.yz, motionDirection));
           let loft = pow(random(seed + 7u), 2.0);
           let rareBurst = pow(random(seed + 41u), 9.0);
-          let lift = 0.12 + localSpeed * (0.16 + loft * 0.45 + rareBurst * 0.62 + min(uphill, 0.8) * 0.30);
+          let lift = (0.12 + localSpeed * (0.16 + loft * 0.45 + rareBurst * 0.62 + min(uphill, 0.8) * 0.30)) * crumb;
           grain.position = vec4f(surfacePosition.x, surface.x + 0.0003, surfacePosition.y, mass);
           grain.velocity = vec4f(horizontal.x, lift, horizontal.y, -1e-6);
-          atomicSub(&exchange[cell], i32(round(mass * 1e9)));
+          atomicSub(&ledger[cell], i32(round(mass * 1e9)));
           launched = true;
         }
       }
@@ -366,10 +455,11 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
       let sourceMoved = max(moved, bed[cell].y * params.grid.w * 0.35);
       let mass = mix(0.0000025, 0.0000055, random(seed + 13u));
       let launchMass = sourceMoved * f32(stride) * agitation * 0.004;
-      let launchChance = min(1.0, launchMass / mass);
+      let launchChance = min(1.0, launchMass / mass) * looseness(moisture[cell]);
       let contactSpeed = length(contactField[cell].zw);
       let activeImpactContact = params.tool.x > 0.0 && contactField[cell].x > 0.001 && impactResponse(contactSpeed) > 0.0;
-      if (!activeImpactContact && reserve > mass * 1.2 && random(seed) < launchChance) {
+      // Kinetic sand never lets loose grains skitter off on their own.
+      if (params.material.x < 0.5 && !activeImpactContact && reserve > mass * 1.2 && random(seed) < launchChance) {
         let position = cellCenter(cell);
         let transport = fluxVector(flow);
         let direction = select(transport / max(length(transport), 1e-9), bedVelocity / max(speed, 1e-9), speed > 0.01);
@@ -379,7 +469,7 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
         let lift = 0.018 + sqrt(max(speed, 0.0)) * (0.16 + random(seed + 7u) * 0.055);
         grain.position = vec4f(position.x, bed[cell].x + 0.0003, position.y, mass);
         grain.velocity = vec4f(horizontal.x, lift, horizontal.y, 0.0);
-        atomicSub(&exchange[cell], i32(round(mass * 1e9)));
+        atomicSub(&ledger[cell], i32(round(mass * 1e9)));
       }
     }
   }

@@ -20,6 +20,10 @@ type NavigatorWithAudioSession = Navigator & {
 const ambientVolume = 0.08
 const waveVolume = 0.92
 const proceduralVolume = 0.34
+const splashVolume = 0.5
+const thudVolume = 0.7
+// Closely spaced pour drops share one splash voice instead of stacking.
+const splashSpacingMilliseconds = 70
 const minimumSampleMilliseconds = 1
 const motionHoldMilliseconds = 55
 
@@ -63,6 +67,9 @@ export class SandSound {
   private readonly waveMetadataReady: Promise<void>
   private waveDuration = 4.754
   private disposed = false
+  private splashNoise: AudioBuffer | undefined
+  private lastSplash = -Infinity
+  private lastThud = -Infinity
 
   constructor() {
     this.ambient.loop = true
@@ -142,6 +149,53 @@ export class SandSound {
     track.turn = turn
     if (distance > 0) track.audibleUntil = performance.now() + motionHoldMilliseconds
     this.sendGestureState()
+  }
+
+  /** A short wet splash: band-limited noise whose band falls as the water spreads. */
+  playSplash(intensity: number) {
+    const context = this.context
+    const now = performance.now()
+    if (this.disposed || !context || context.state !== 'running' || now - this.lastSplash < splashSpacingMilliseconds) return
+    this.lastSplash = now
+    if (!this.splashNoise) {
+      const length = Math.round(context.sampleRate * 0.6)
+      this.splashNoise = context.createBuffer(1, length, context.sampleRate)
+      const samples = this.splashNoise.getChannelData(0)
+      for (let index = 0; index < length; index++) samples[index] = Math.random() * 2 - 1
+    }
+    const level = Math.max(0.05, Math.min(1, intensity))
+    const duration = 0.12 + 0.38 * level
+    const start = context.currentTime
+    const source = new AudioBufferSourceNode(context, { buffer: this.splashNoise })
+    const band = new BiquadFilterNode(context, { type: 'bandpass', Q: 0.9, frequency: 2600 + 1800 * level })
+    band.frequency.exponentialRampToValueAtTime(700, start + duration)
+    const gain = new GainNode(context, { gain: 0 })
+    gain.gain.linearRampToValueAtTime(splashVolume * level, start + 0.012)
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+    source.connect(band).connect(gain).connect(context.destination)
+    source.start(start, Math.random() * 0.1, duration + 0.05)
+    source.onended = () => { source.disconnect(); band.disconnect(); gain.disconnect() }
+  }
+
+  /** A soft low thud: a shovel scoop landing, or a bucket turned out (intensity 1). */
+  playThud(intensity: number) {
+    const context = this.context
+    const now = performance.now()
+    if (this.disposed || !context || context.state !== 'running' || now - this.lastThud < splashSpacingMilliseconds) return
+    this.lastThud = now
+    if (!this.splashNoise) return this.playSplash(0.01)
+    const level = Math.max(0.05, Math.min(1, intensity))
+    const duration = 0.09 + 0.16 * level
+    const start = context.currentTime
+    const source = new AudioBufferSourceNode(context, { buffer: this.splashNoise })
+    const body = new BiquadFilterNode(context, { type: 'lowpass', Q: 1.1, frequency: 260 + 380 * level })
+    body.frequency.exponentialRampToValueAtTime(90, start + duration)
+    const gain = new GainNode(context, { gain: 0 })
+    gain.gain.linearRampToValueAtTime(thudVolume * level, start + 0.006)
+    gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
+    source.connect(body).connect(gain).connect(context.destination)
+    source.start(start, Math.random() * 0.2, duration + 0.05)
+    source.onended = () => { source.disconnect(); body.disconnect(); gain.disconnect() }
   }
 
   update(now: number) {

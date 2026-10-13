@@ -1,4 +1,4 @@
-import { SAND, type Stroke } from '../config'
+import { MATERIALS, SAND, SYMMETRIES, TOOL_KIND, type Point, type SandMaterial, type Stroke, type Symmetry } from '../config'
 import { checkedShader } from '../platform/shader'
 import type { WaveResetState } from '../reset/effect'
 import { idleWaveResetState } from '../reset/effect'
@@ -9,9 +9,11 @@ import { CoconutShadow } from './coconut-shadow'
 import { BedLighting } from './lighting'
 import { GLINT_FORMAT, HDR_SCENE_FORMAT, SandPostProcess } from './postprocess'
 import { surfaceShader } from './shaders'
+import { DaylightCycle, type Daylight } from './daylight'
 
-const LIGHT_ANGLE = -0.8
-const LIGHT_DIRECTION = [Math.cos(LIGHT_ANGLE), 0.65, Math.sin(LIGHT_ANGLE)] as const
+export type ToolPreview = { kind: number; angle: number; direction: Point; symmetry: Symmetry; variant: number }
+export const fingerPreview: ToolPreview = { kind: TOOL_KIND.finger, angle: 0, direction: { x: 1, y: 0 }, symmetry: SYMMETRIES[0], variant: 0 }
+
 
 export class SandRenderer {
   readonly camera = new SandCamera()
@@ -29,7 +31,9 @@ export class SandRenderer {
   private depth: GPUTexture | undefined
   private width = 0
   private height = 0
-  private readonly data = new Float32Array(36)
+  private readonly data = new Float32Array(60)
+  private material: SandMaterial = MATERIALS[0]
+  private daylight: Daylight = new DaylightCycle().sample(0)
 
   private readonly device: GPUDevice
   private readonly solver: SandSolver
@@ -64,7 +68,7 @@ export class SandRenderer {
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' },
     })
-    this.groups = this.solver.buffers.map((buffer) => this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
+    this.groups = this.solver.buffers.map((buffer, index) => this.device.createBindGroup({ layout: this.pipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: this.uniform } },
       { binding: 1, resource: { buffer } },
       { binding: 3, resource: { buffer: this.lighting.buffer } },
@@ -72,6 +76,9 @@ export class SandRenderer {
       { binding: 5, resource: this.shadow.texture.createView() },
       { binding: 6, resource: this.airborneShadow.sampler },
       { binding: 7, resource: this.airborneShadow.texture.createView() },
+      { binding: 8, resource: { buffer: this.solver.water.moisture[index] } },
+      { binding: 9, resource: { buffer: this.solver.water.glow } },
+      { binding: 10, resource: { buffer: this.solver.water.packing[index] } },
     ] }))
     this.grainPipeline = await this.device.createRenderPipelineAsync({ label: 'Loose sand grains', layout: 'auto',
       vertex: { module, entryPoint: 'grainVertex' }, fragment: { module, entryPoint: 'grainFragment', targets: [
@@ -104,7 +111,16 @@ export class SandRenderer {
     this.shadow.resize(width, height, (x, y) => this.camera.screenToBed(x, y, width, height))
   }
 
-  encode(encoder: GPUCommandEncoder, target: GPUTextureView, pointer: Stroke, now: number, showPointer = false, waveState: WaveResetState = idleWaveResetState()) {
+  /** The sand's material for the coming frames. */
+  setMaterial(material: SandMaterial) { this.material = material }
+
+  /** The light for the coming frames. */
+  setDaylight(daylight: Daylight) {
+    this.daylight = daylight
+    this.shadow.setLight(daylight.direction)
+  }
+
+  encode(encoder: GPUCommandEncoder, target: GPUTextureView, pointer: Stroke, now: number, showPointer = false, waveState: WaveResetState = idleWaveResetState(), preview: ToolPreview = fingerPreview) {
     if (!this.depth) throw new Error('Renderer needs a nonzero drawing buffer')
     this.shadow.encode(encoder, now)
     this.data.set([
@@ -112,16 +128,23 @@ export class SandRenderer {
       ...this.camera.forward, this.camera.aspect,
       ...this.camera.right, 0,
       ...this.camera.up, 0,
-      ...LIGHT_DIRECTION, 0,
+      ...this.daylight.direction, 0,
       this.solver.resolution, SAND.extent, this.width, this.height,
       pointer.to.x, pointer.to.y, pointer.radius, showPointer ? 1 : 0,
       this.shadow.centerX, this.shadow.centerZ, this.shadow.halfWidth, this.shadow.halfHeight,
-      this.shadow.opacity, 0, 0, 0,
+      this.shadow.opacity * this.daylight.shadow, 0, 0, 0,
+      preview.kind, preview.angle, preview.direction.x, preview.direction.y,
+      preview.symmetry.rotations, preview.symmetry.mirror ? 1 : 0, preview.variant, 0,
+      ...this.daylight.sun, this.daylight.night,
+      ...this.daylight.sky, 0,
+      this.material.kinetic ? 1 : 0, 0, 0, 0,
+      ...this.material.color, 0,
     ])
     this.device.queue.writeBuffer(this.uniform, 0, this.data)
-    if (!waveState.active || !waveState.incoming) this.lighting.encode(encoder, LIGHT_ANGLE)
+    const [x, y, z] = this.daylight.direction
+    if (!waveState.active || !waveState.incoming) this.lighting.encode(encoder, x + y * 7 + z * 49)
     if (waveState.justStarted) this.airborneShadow.clear(encoder)
-    else if (!waveState.active) this.airborneShadow.encode(encoder, LIGHT_DIRECTION)
+    else if (!waveState.active) this.airborneShadow.encode(encoder, this.daylight.direction)
     const pass = encoder.beginRenderPass({ label: 'Sand image', colorAttachments: [
       { view: this.post.target, clearValue: { r: 0.1778341, g: 0.12052718, b: 0.06615726, a: 1 }, loadOp: 'clear', storeOp: 'store' },
       { view: this.post.glintTarget, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },

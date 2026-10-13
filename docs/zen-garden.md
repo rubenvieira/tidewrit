@@ -1,0 +1,5 @@
+# Zen garden autopilot
+
+The autopilot is a virtual pointer (id -2) that feeds the ordinary stroke queue with a given tool, radius and speed (the rake for gardens, the finger for writing; see `lettering.md`), so it shares all transport, symmetry, and history behavior with hand drawing. It advances at 0.3 m/s along precomputed polylines and interpolates within segments, so motion is smooth regardless of frame rate.
+
+Patterns are fitted to the visible bed between the masthead and toolbar, as computed from the camera, rather than to the whole bed. The rake is narrowed so at least ten passes fit across the shorter side (never below 2 cm half-width), and passes are spaced one rake width apart (×1.02) so grooves tile without seams. The garden pattern places 1–3 unraked stones ringed by up to three concentric passes (fewer if they would not fit), clips the straight lines around the ring fields with a gap, and rakes lines boustrophedon before the rings. If a blur or reset cancels the virtual pointer, it resumes from where it stopped.

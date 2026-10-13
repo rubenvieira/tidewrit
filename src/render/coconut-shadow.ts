@@ -28,9 +28,8 @@ type ShadowPlacement = {
   halfHeight: number
 }
 
-const LIGHT_X = Math.cos(-0.8)
-const LIGHT_Y = 0.65
-const LIGHT_Z = Math.sin(-0.8)
+// The original sun; the live direction comes from setLight().
+const DEFAULT_LIGHT = [Math.cos(-0.8), 0.65, Math.sin(-0.8)] as const
 const SHADOW_RESOLUTION = 512
 const SHADOW_OPACITY = 0.82
 
@@ -48,6 +47,7 @@ const shadowShader = `
 struct ShadowView {
   projected: vec4f,
   motion: vec4f,
+  light: vec4f,
 }
 @group(0) @binding(0) var<uniform> view: ShadowView;
 @group(0) @binding(1) var colorSampler: sampler;
@@ -129,7 +129,7 @@ fn smoothCurve(value: f32) -> f32 {
   let rootCorrection = (anchorSway - vertexSway) * (1.0 - progress) * leaf;
   position = vec3f(position.x + rootCorrection.x, position.y, position.z + rootCorrection.y);
 
-  let projected = position.xz - vec2f(${LIGHT_X.toFixed(9)}, ${LIGHT_Z.toFixed(9)}) * (position.y / ${LIGHT_Y.toFixed(9)});
+  let projected = position.xz - view.light.xz * (position.y / view.light.y);
   let normalized = (projected - view.projected.xy) / view.projected.zw;
   var output: VertexOutput;
   output.clip = vec4f(normalized.x, -normalized.y, 0.0, 1.0);
@@ -431,29 +431,36 @@ async function loadTree(): Promise<ParsedTree> {
     return { ...mesh, positions, wind: buildWindData(positions, mesh.indices) }
   })
 
-  let minProjectedX = Infinity; let minProjectedZ = Infinity
-  let maxProjectedX = -Infinity; let maxProjectedZ = -Infinity
-  for (const mesh of meshes) {
-    for (let index = 0; index < mesh.positions.length; index += 3) {
-      const x = mesh.positions[index]!
-      const y = mesh.positions[index + 1]!
-      const z = mesh.positions[index + 2]!
-      const projectedX = x - LIGHT_X * y / LIGHT_Y
-      const projectedZ = z - LIGHT_Z * y / LIGHT_Y
-      minProjectedX = Math.min(minProjectedX, projectedX)
-      maxProjectedX = Math.max(maxProjectedX, projectedX)
-      minProjectedZ = Math.min(minProjectedZ, projectedZ)
-      maxProjectedZ = Math.max(maxProjectedZ, projectedZ)
-    }
-  }
-  const projectedCenter = { x: (minProjectedX + maxProjectedX) * 0.5, y: (minProjectedZ + maxProjectedZ) * 0.5 }
-  const projectedHalfSize = { x: (maxProjectedX - minProjectedX) * 0.58, y: (maxProjectedZ - minProjectedZ) * 0.58 }
+  const { projectedCenter, projectedHalfSize } = projectBounds(meshes.map((mesh) => mesh.positions), DEFAULT_LIGHT)
 
   const imageInfo = gltf.images[0]!
   const imageView = gltf.bufferViews[imageInfo.bufferView]!
   const imageStart = imageView.byteOffset ?? 0
   const image = new Blob([binary.slice(imageStart, imageStart + imageView.byteLength)], { type: imageInfo.mimeType })
   return { meshes, image, projectedCenter, projectedHalfSize }
+}
+
+/** Bounds of the tree's shadow on the ground plane for a light direction. */
+function projectBounds(meshes: Float32Array[], light: readonly [number, number, number]) {
+  let minProjectedX = Infinity; let minProjectedZ = Infinity
+  let maxProjectedX = -Infinity; let maxProjectedZ = -Infinity
+  for (const positions of meshes) {
+    for (let index = 0; index < positions.length; index += 3) {
+      const x = positions[index]!
+      const y = positions[index + 1]!
+      const z = positions[index + 2]!
+      const projectedX = x - light[0] * y / light[1]
+      const projectedZ = z - light[2] * y / light[1]
+      minProjectedX = Math.min(minProjectedX, projectedX)
+      maxProjectedX = Math.max(maxProjectedX, projectedX)
+      minProjectedZ = Math.min(minProjectedZ, projectedZ)
+      maxProjectedZ = Math.max(maxProjectedZ, projectedZ)
+    }
+  }
+  return {
+    projectedCenter: { x: (minProjectedX + maxProjectedX) * 0.5, y: (minProjectedZ + maxProjectedZ) * 0.5 },
+    projectedHalfSize: { x: (maxProjectedX - minProjectedX) * 0.58, y: (maxProjectedZ - minProjectedZ) * 0.58 },
+  }
 }
 
 function createVertexData(mesh: ParsedMesh) {
@@ -489,7 +496,10 @@ export class CoconutShadow {
   private readonly device: GPUDevice
   private readonly shadowUniform: GPUBuffer
   private readonly stabilizeUniform: GPUBuffer
-  private readonly shadowData = new Float32Array(8)
+  private readonly shadowData = new Float32Array(12)
+  private light: readonly [number, number, number] = DEFAULT_LIGHT
+  private treePositions: Float32Array[] = []
+  private view: { width: number; height: number; screenToBed: (x: number, y: number) => Point2 } | undefined
   private readonly stabilizeData = new Float32Array(4)
   private shadowPipeline!: GPURenderPipeline
   private stabilizePipeline!: GPURenderPipeline
@@ -519,8 +529,8 @@ export class CoconutShadow {
   async initialize() {
     if (typeof window === 'undefined' || typeof createImageBitmap !== 'function') return
     const tree = await loadTree()
-    this.projectedCenter = tree.projectedCenter
-    this.projectedHalfSize = tree.projectedHalfSize
+    this.treePositions = tree.meshes.map((mesh) => mesh.positions)
+    this.reproject()
     for (const mesh of tree.meshes) {
       const vertices = createVertexData(mesh)
       const vertex = this.device.createBuffer({ label: 'Coconut shadow vertices', size: vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST })
@@ -569,13 +579,29 @@ export class CoconutShadow {
   }
 
   resize(width: number, height: number, screenToBed: (x: number, y: number) => Point2) {
+    this.view = { width, height, screenToBed }
     const aspect = this.projectedHalfSize.x / Math.max(this.projectedHalfSize.y, 1e-4)
     this.placement = placement(screenToBed, width, height, this.mobile, aspect)
   }
 
+  /** Moves the sun; the shadow's projection and on-screen footprint follow it. */
+  setLight(direction: readonly [number, number, number]) {
+    if (direction.every((component, axis) => component === this.light[axis])) return
+    this.light = [direction[0], Math.max(direction[1], 0.05), direction[2]]
+    this.reproject()
+  }
+
+  private reproject() {
+    if (!this.treePositions.length) return
+    const bounds = projectBounds(this.treePositions, this.light)
+    this.projectedCenter = bounds.projectedCenter
+    this.projectedHalfSize = bounds.projectedHalfSize
+    if (this.view) this.resize(this.view.width, this.view.height, this.view.screenToBed)
+  }
+
   encode(encoder: GPUCommandEncoder, now: number) {
     if (!this.shadowPipeline || !this.stabilizePipeline) return
-    this.shadowData.set([this.projectedCenter.x, this.projectedCenter.y, this.projectedHalfSize.x, this.projectedHalfSize.y, now * 0.001, 0, 0, 0])
+    this.shadowData.set([this.projectedCenter.x, this.projectedCenter.y, this.projectedHalfSize.x, this.projectedHalfSize.y, now * 0.001, 0, 0, 0, ...this.light, 0])
     this.stabilizeData.set([1 / SHADOW_RESOLUTION, 1 / SHADOW_RESOLUTION, this.hasHistory ? 1 : 0, 0])
     this.device.queue.writeBuffer(this.shadowUniform, 0, this.shadowData)
     this.device.queue.writeBuffer(this.stabilizeUniform, 0, this.stabilizeData)

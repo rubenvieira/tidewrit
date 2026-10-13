@@ -6,7 +6,8 @@ export function normalize(vector: Vector3): Vector3 {
   return vector.map((component) => component / length) as Vector3
 }
 export class SandCamera {
-  readonly eye: Vector3 = [0, 0.52, 0.26]
+  // The eye sits a fixed height above the bed surface, so bed depth never changes the view.
+  readonly eye: Vector3 = [0, SAND.depth + 0.488, 0.26]
   readonly forward = normalize([0, SAND.depth - this.eye[1], -this.eye[2]])
   readonly right: Vector3 = [1, 0, 0]
   readonly up: Vector3 = [0, -this.forward[2], this.forward[1]]
