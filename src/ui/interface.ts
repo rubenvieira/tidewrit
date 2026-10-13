@@ -44,8 +44,8 @@ export function createInterface(root: HTMLDivElement) {
   root.innerHTML = `
     <canvas class="surface" aria-label="Interactive sand bed. Drag to draw. Keys 1 to 0, minus and equals pick finger, rake, broom, smoother, wind, shell, feet, dig, bucket, pour, drip or water; K picks the knife. T changes the sand, M changes symmetry, L changes the time of day, G starts a zen garden, W writes a message. Arrow keys move a virtual tool; hold Space to draw. Brackets change tool size. Control Z undoes, S saves an image, R resets." tabindex="0"></canvas>
     <header class="masthead">
-      <h1 class="brand" aria-label="Sandboard">
-        <span aria-hidden="true">s</span><span aria-hidden="true">a</span><span aria-hidden="true">n</span><span aria-hidden="true">d</span><span aria-hidden="true">b</span><span aria-hidden="true">o</span><span aria-hidden="true">a</span><span aria-hidden="true">r</span><span aria-hidden="true">d</span>
+      <h1 class="brand" aria-label="Tidewrit">
+        <span aria-hidden="true">t</span><span aria-hidden="true">i</span><span aria-hidden="true">d</span><span aria-hidden="true">e</span><span aria-hidden="true">w</span><span aria-hidden="true">r</span><span aria-hidden="true">i</span><span aria-hidden="true">t</span>
       </h1>
     </header>
     <nav class="actions" aria-label="History and export">

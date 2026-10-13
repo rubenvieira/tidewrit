@@ -14,7 +14,7 @@ import { SandHistory } from './simulation/history'
 import { SandSolver } from './simulation/solver'
 import type { InterfaceElements } from './ui/interface'
 
-export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor) {
+export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor) {
   const gpu = await createGpu(ui.canvas, monitor)
   const solver = new SandSolver(gpu.device)
   const renderer = new SandRenderer(gpu.device, solver, gpu.format, useMobileGrainFiltering())
@@ -169,7 +169,7 @@ export async function startSandboard(ui: InterfaceElements, monitor: BootMonitor
         if (finishExport) {
           saving = true
           ui.save.disabled = true
-          void finishExport().then(deliverImage).catch((error: unknown) => console.error('[Sandboard] Image export failed', error)).finally(() => {
+          void finishExport().then(deliverImage).catch((error: unknown) => console.error('[Tidewrit] Image export failed', error)).finally(() => {
             saving = false
             ui.save.disabled = false
           })

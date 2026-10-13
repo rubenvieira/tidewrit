@@ -326,7 +326,7 @@ export class SandSound {
   private ensureProcedural(context: AudioContext) {
     if (this.proceduralReady) return this.proceduralReady
     this.proceduralReady = this.createProcedural(context).catch((error: unknown) => {
-      console.warn('[Sandboard audio] Procedural drawing sound unavailable.', error)
+      console.warn('[Tidewrit audio] Procedural drawing sound unavailable.', error)
     })
     return this.proceduralReady
   }

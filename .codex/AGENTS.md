@@ -1,6 +1,6 @@
 # Context
 
-This repo is building **Sandboard**: a Houdini-quality, WebGPU-only 3D game/simulation. Use convenient three.js features for basic scene setup, but go deeper in stacks, wgsl, wasm, etc are all welcome to bring production grade quality and efficiency
+This repo is building **Tidewrit**: a Houdini-quality, WebGPU-only 3D game/simulation. Use convenient three.js features for basic scene setup, but go deeper in stacks, wgsl, wasm, etc are all welcome to bring production grade quality and efficiency
 
 We're building a browser-based interactive sand surface that aims for **Houdini-level sand simulation and rendering quality**, not a lightweight demo or visual trick: the entire experience should read like a close camera view of a real sand bed, with natural pointer-driven drawing that feels like physically moving a finger through actual sand, including convincing granular motion, displacement, settling, surface detail, lighting, and material response; this is a serious graphics and simulation engineering project, choose whatever web technologies, architecture, and algorithms you think are appropriate, validate it thoroughly with real tests and runtime checks, and make all technical and artistic decisions from first principles rather than inheriting assumptions from any previous attempt.
 

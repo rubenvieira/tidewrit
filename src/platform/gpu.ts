@@ -7,7 +7,7 @@ export async function createGpu(canvas: HTMLCanvasElement, monitor: BootMonitor)
   if (!adapter) throw new Error('No hardware WebGPU adapter is available.')
   if (adapter.info.isFallbackAdapter) throw new Error('A hardware WebGPU adapter is required, not a software fallback.')
   monitor.setAdapter([adapter.info.vendor, adapter.info.architecture, adapter.info.description].filter(Boolean).join(' / '))
-  const device = await adapter.requestDevice({ label: 'Sandboard GPU' })
+  const device = await adapter.requestDevice({ label: 'Tidewrit GPU' })
   let disposed = false
   void device.lost.then((info) => {
     if (!disposed) monitor.fail(new Error(`GPU device lost (${info.reason}): ${info.message}`))

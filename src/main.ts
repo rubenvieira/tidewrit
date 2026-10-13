@@ -7,6 +7,6 @@ const monitor = new BootMonitor(ui)
 
 void monitor.run(async () => {
   monitor.stage('Loading simulation')
-  const { startSandboard } = await import('./runtime')
-  await startSandboard(ui, monitor)
+  const { startTidewrit } = await import('./runtime')
+  await startTidewrit(ui, monitor)
 })
