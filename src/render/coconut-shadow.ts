@@ -386,7 +386,7 @@ function parseGlb(buffer: ArrayBuffer) {
 }
 
 async function loadTree(): Promise<ParsedTree> {
-  const response = await fetch('/scene_assets/coconut_tree.glb')
+  const response = await fetch(`${import.meta.env.BASE_URL}scene_assets/coconut_tree.glb`)
   if (!response.ok) throw new Error(`Unable to load coconut tree (${response.status}).`)
   const { gltf, binary } = parseGlb(await response.arrayBuffer())
 

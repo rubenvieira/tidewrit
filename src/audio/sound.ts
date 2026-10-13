@@ -54,8 +54,8 @@ function requestPlaybackAudioSession() {
 }
 
 export class SandSound {
-  private readonly ambient = new Audio('/scene_assets/beach.mp3')
-  private readonly wave = new Audio('/scene_assets/wave.mp3')
+  private readonly ambient = new Audio(`${import.meta.env.BASE_URL}scene_assets/beach.mp3`)
+  private readonly wave = new Audio(`${import.meta.env.BASE_URL}scene_assets/wave.mp3`)
   private readonly gestures = new Map<number, GestureTrack>()
   private readonly unlockController = new AbortController()
   private context: AudioContext | undefined
