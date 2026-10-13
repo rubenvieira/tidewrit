@@ -1,4 +1,5 @@
 import { sandWorkletSource } from './sand-worklet'
+import { readMutedPreference, writeMutedPreference } from './preferences'
 
 type GestureTrack = {
   x: number
@@ -26,6 +27,7 @@ const thudVolume = 0.7
 const splashSpacingMilliseconds = 70
 const minimumSampleMilliseconds = 1
 const motionHoldMilliseconds = 55
+const metadataWaitMilliseconds = 1500
 
 function normalizedSpeed(pxPerSecond: number) {
   return Math.max(0, Math.min(1, (pxPerSecond - 24) / 1080))
@@ -57,6 +59,7 @@ export class SandSound {
   private readonly gestures = new Map<number, GestureTrack>()
   private readonly unlockController = new AbortController()
   private context: AudioContext | undefined
+  private masterGain: GainNode | undefined
   private ambientSource: MediaElementAudioSourceNode | undefined
   private ambientGain: GainNode | undefined
   private waveSource: MediaElementAudioSourceNode | undefined
@@ -70,6 +73,8 @@ export class SandSound {
   private splashNoise: AudioBuffer | undefined
   private lastSplash = -Infinity
   private lastThud = -Infinity
+  private isMuted = readMutedPreference()
+  private hidden = document.visibilityState === 'hidden'
 
   constructor() {
     this.ambient.loop = true
@@ -89,7 +94,28 @@ export class SandSound {
     const { signal } = this.unlockController
     window.addEventListener('pointerdown', unlock, { signal, passive: true })
     window.addEventListener('keydown', unlock, { signal })
+    document.addEventListener('visibilitychange', () => {
+      this.hidden = document.visibilityState === 'hidden'
+      if (this.hidden) {
+        this.cancelAll()
+        this.silencePlayback()
+      } else {
+        this.activatePlayback()
+      }
+    }, { signal })
   }
+
+  get muted() { return this.isMuted }
+
+  setMuted(muted: boolean) {
+    if (this.disposed) return
+    this.isMuted = muted
+    writeMutedPreference(muted)
+    if (muted) this.silencePlayback()
+    else this.activatePlayback()
+  }
+
+  private get silenced() { return this.isMuted || this.hidden }
 
   prepare() {
     if (this.prepareReady) return this.prepareReady
@@ -155,7 +181,7 @@ export class SandSound {
   playSplash(intensity: number) {
     const context = this.context
     const now = performance.now()
-    if (this.disposed || !context || context.state !== 'running' || now - this.lastSplash < splashSpacingMilliseconds) return
+    if (this.disposed || this.silenced || !context || !this.masterGain || context.state !== 'running' || now - this.lastSplash < splashSpacingMilliseconds) return
     this.lastSplash = now
     if (!this.splashNoise) {
       const length = Math.round(context.sampleRate * 0.6)
@@ -172,7 +198,7 @@ export class SandSound {
     const gain = new GainNode(context, { gain: 0 })
     gain.gain.linearRampToValueAtTime(splashVolume * level, start + 0.012)
     gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-    source.connect(band).connect(gain).connect(context.destination)
+    source.connect(band).connect(gain).connect(this.masterGain)
     source.start(start, Math.random() * 0.1, duration + 0.05)
     source.onended = () => { source.disconnect(); band.disconnect(); gain.disconnect() }
   }
@@ -181,7 +207,7 @@ export class SandSound {
   playThud(intensity: number) {
     const context = this.context
     const now = performance.now()
-    if (this.disposed || !context || context.state !== 'running' || now - this.lastThud < splashSpacingMilliseconds) return
+    if (this.disposed || this.silenced || !context || !this.masterGain || context.state !== 'running' || now - this.lastThud < splashSpacingMilliseconds) return
     this.lastThud = now
     if (!this.splashNoise) return this.playSplash(0.01)
     const level = Math.max(0.05, Math.min(1, intensity))
@@ -193,7 +219,7 @@ export class SandSound {
     const gain = new GainNode(context, { gain: 0 })
     gain.gain.linearRampToValueAtTime(thudVolume * level, start + 0.006)
     gain.gain.exponentialRampToValueAtTime(0.0001, start + duration)
-    source.connect(body).connect(gain).connect(context.destination)
+    source.connect(body).connect(gain).connect(this.masterGain)
     source.start(start, Math.random() * 0.2, duration + 0.05)
     source.onended = () => { source.disconnect(); body.disconnect(); gain.disconnect() }
   }
@@ -228,11 +254,15 @@ export class SandSound {
     this.waveSource = undefined
     this.waveGain?.disconnect()
     this.waveGain = undefined
-    if (this.context) void this.context.close()
+    this.masterGain?.disconnect()
+    this.masterGain = undefined
+    if (this.context) void this.context.close().catch(() => undefined)
     this.context = undefined
     this.ambient.pause()
     this.wave.pause()
-    this.wave.currentTime = 0
+    try { this.wave.currentTime = 0 } catch {
+      // The media pipeline may not have attached before disposal.
+    }
     this.ambient.removeAttribute('src')
     this.wave.removeAttribute('src')
     this.ambient.load()
@@ -252,15 +282,29 @@ export class SandSound {
   }
 
   private activatePlayback() {
-    if (this.disposed) return
+    if (this.disposed || this.silenced) return
     const context = this.ensureContext()
+    this.masterGain?.gain.setValueAtTime(1, context.currentTime)
 
     // Keep resume() and media play() in the same synchronous user-activation
     // stack. In particular, do not await AudioWorklet.addModule() here: WebKit
     // can consume the transient activation before an asynchronous continuation.
-    if (context.state !== 'running') void context.resume().catch(() => undefined)
+    // Always enqueue resume, including when a previous suspend is still pending
+    // and the browser reports a running state during a quick mute/unmute.
+    void context.resume().catch(() => undefined)
     void this.playAmbient()
     void this.ensureProcedural(context).then(() => this.sendGestureState())
+  }
+
+  private silencePlayback() {
+    const context = this.context
+    if (context) {
+      this.masterGain?.gain.setValueAtTime(0, context.currentTime)
+      void context.suspend().catch(() => undefined)
+    }
+    this.ambient.pause()
+    this.wave.pause()
+    this.sendGestureState()
   }
 
   private ensureContext() {
@@ -272,26 +316,30 @@ export class SandSound {
     requestPlaybackAudioSession()
 
     const context = new AudioContext({ latencyHint: 'interactive' })
+    const masterGain = new GainNode(context, { gain: this.silenced ? 0 : 1 })
+    masterGain.connect(context.destination)
     const ambientSource = context.createMediaElementSource(this.ambient)
     const ambientGain = new GainNode(context, { gain: ambientVolume })
-    ambientSource.connect(ambientGain).connect(context.destination)
+    ambientSource.connect(ambientGain).connect(masterGain)
 
     const waveSource = context.createMediaElementSource(this.wave)
     const waveGain = new GainNode(context, { gain: waveVolume })
-    waveSource.connect(waveGain).connect(context.destination)
+    waveSource.connect(waveGain).connect(masterGain)
 
     this.context = context
+    this.masterGain = masterGain
     this.ambientSource = ambientSource
     this.ambientGain = ambientGain
     this.waveSource = waveSource
     this.waveGain = waveGain
+    if (this.silenced) this.silencePlayback()
     return context
   }
 
   get resetDurationSeconds() { return this.waveDuration }
 
   playResetWave() {
-    if (this.disposed) return this.waveDuration
+    if (this.disposed || this.silenced) return this.waveDuration
     this.activatePlayback()
     this.wave.pause()
     try { this.wave.currentTime = 0 } catch {
@@ -303,24 +351,42 @@ export class SandSound {
 
   private loadWaveMetadata() {
     return new Promise<void>((resolve) => {
-      const finalize = () => {
-        const duration = this.wave.duration
-        if (Number.isFinite(duration) && duration > 0) this.waveDuration = duration
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const { signal } = this.unlockController
+      const settle = () => {
+        if (timer !== undefined) clearTimeout(timer)
+        timer = undefined
         resolve()
       }
+      const cleanup = () => {
+        settle()
+        this.wave.removeEventListener('loadedmetadata', onMetadata)
+        this.wave.removeEventListener('error', cleanup)
+        signal.removeEventListener('abort', cleanup)
+      }
+      const onMetadata = () => {
+        const duration = this.wave.duration
+        if (Number.isFinite(duration) && duration > 0) this.waveDuration = duration
+        cleanup()
+      }
       if (this.wave.readyState >= HTMLMediaElement.HAVE_METADATA) {
-        finalize()
+        onMetadata()
         return
       }
-      this.wave.addEventListener('loadedmetadata', finalize, { once: true })
-      this.wave.addEventListener('error', () => resolve(), { once: true })
+      // Slow or missing media must not hold scene boot. Late metadata can still
+      // improve the duration used by subsequent resets after this wait expires.
+      timer = setTimeout(settle, metadataWaitMilliseconds)
+      this.wave.addEventListener('loadedmetadata', onMetadata, { once: true })
+      this.wave.addEventListener('error', cleanup, { once: true })
+      signal.addEventListener('abort', cleanup, { once: true })
       this.wave.load()
     })
   }
 
   private async playAmbient() {
-    if (this.disposed || !this.ambient.paused) return
+    if (this.disposed || this.silenced || !this.ambient.paused) return
     await this.ambient.play().catch(() => undefined)
+    if (this.disposed || this.silenced) this.ambient.pause()
   }
 
   private ensureProcedural(context: AudioContext) {
@@ -357,15 +423,15 @@ export class SandSound {
       attack: 0.004,
       release: 0.09,
     })
-    const master = new GainNode(context, { gain: proceduralVolume })
+    const proceduralGain = new GainNode(context, { gain: proceduralVolume })
 
-    sandNode.connect(highpass).connect(presence).connect(soften).connect(compressor).connect(master).connect(context.destination)
+    sandNode.connect(highpass).connect(presence).connect(soften).connect(compressor).connect(proceduralGain).connect(this.masterGain!)
     this.sandNode = sandNode
   }
 
   private sendGestureState(now = performance.now()) {
     if (!this.sandNode) return
-    if (!this.gestures.size) {
+    if (this.silenced || !this.gestures.size) {
       this.sandNode.port.postMessage({ type: 'state', gate: 0, speed: 0, pressure: 0, turn: 0 })
       return
     }

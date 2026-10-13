@@ -1,26 +1,77 @@
 import { KINETIC, SAND, WATER, type Deposit } from '../config'
 import { checkedShader } from '../platform/shader'
 import { fluxLayout } from './flux'
+import { sweptKernels } from './swept-kernels'
 
-const dropParamVectors = 3 + WATER.maxDropsPerFrame * 2
+const dropParamVectors = 4 + WATER.maxDropsPerFrame * 3
 const dropParamBytes = dropParamVectors * 16
 
-// Lands deposits: soft moisture disks, a zero-mean impact profile
-// -(1 - r²)·exp(-r²) whose depression and rim integrate to zero (so pits move
-// sand without creating or destroying it), and Gaussian mounds of new sand
-// for pouring and dripping. Only the deposits' bounding region is dispatched.
+// Impact pits use conservative local flux. Other deposits still need only the
+// wet pass, over their bounding region; the ordinary solver overwrites this
+// borrowed flux scratch before its next granular step.
 const dropShader = `
+${sweptKernels}
+${fluxLayout}
 struct DropParams {
   grid: vec4f,
   region: vec4f,
+  impactRegion: vec4f,
   limits: vec4f,
-  drops: array<vec4f, ${WATER.maxDropsPerFrame * 2}>,
+  drops: array<vec4f, ${WATER.maxDropsPerFrame * 3}>,
 }
 @group(0) @binding(0) var<uniform> params: DropParams;
 @group(0) @binding(1) var<storage, read_write> state: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> moisture: array<f32>;
 @group(0) @binding(3) var<storage, read_write> glow: array<f32>;
 @group(0) @binding(4) var<storage, read_write> packing: array<f32>;
+@group(0) @binding(5) var<storage, read_write> impactFlux: array<Flux>;
+
+fn dropAddress(cell: vec2i) -> u32 {
+  return u32(cell.y) * u32(params.grid.x) + u32(cell.x);
+}
+fn inImpactRegion(cell: vec2i) -> bool {
+  return all(cell >= vec2i(params.impactRegion.xy)) && all(cell < vec2i(params.impactRegion.xy + params.impactRegion.zw));
+}
+struct ImpactPotentials { center: f32, adjacent: vec4f }
+fn impactPotentials(position: vec2f) -> ImpactPotentials {
+  var center = 0.0;
+  var adjacent = vec4f(0.0);
+  for (var drop = 0u; drop < u32(params.grid.w); drop++) {
+    let shape = params.drops[drop * 3u];
+    let impact = params.drops[drop * 3u + 1u];
+    if (impact.x <= 0.0) { continue; }
+    let prepared = params.drops[drop * 3u + 2u];
+    let offset = position - shape.xy;
+    let squared = dot(offset, offset);
+    // The broad batch can contain distant drops. Only their one-cell halo
+    // warrants Gaussian work; all radius/scale preparation happened on CPU.
+    if (squared > prepared.w) { continue; }
+    let radial = squared * prepared.z;
+    if (radial < 9.0) {
+      // The discrete Laplacian tends to -(1-r²) exp(-r²) as cells resolve the
+      // drop. Sum overlapping pressure fields before choosing flow direction.
+      center += impact.w * exp(-radial);
+    }
+    let axial = max(vec4f(0.0), (vec4f(squared + params.grid.y * params.grid.y)
+      + vec4f(-offset.x, offset.x, -offset.y, offset.y) * (2.0 * params.grid.y)) * prepared.z);
+    adjacent += impact.w * select(vec4f(0.0), exp(-axial), axial < vec4f(9.0));
+  }
+  return ImpactPotentials(center, adjacent);
+}
+@compute @workgroup_size(8, 8)
+fn impact(@builtin(global_invocation_id) invocation: vec3u) {
+  if (any(vec2f(invocation.xy) >= params.impactRegion.zw)) { return; }
+  let cell = vec2i(params.impactRegion.xy) + vec2i(invocation.xy);
+  let position = (vec2f(cell) + 0.5) * params.grid.y - params.grid.z * 0.5;
+  let pressure = impactPotentials(position);
+  var outgoing = max(vec4f(0.0), vec4f(pressure.center) - pressure.adjacent);
+  for (var axis = 0u; axis < 4u; axis++) {
+    if (!inImpactRegion(cell + neighbors[axis])) { outgoing[axis] = 0.0; }
+  }
+  let available = max(0.0, state[dropAddress(cell)].x - params.limits.y);
+  let limiter = min(1.0, available / max(dot(outgoing, vec4f(1.0)), 1e-12));
+  impactFlux[dropAddress(cell)].axial = outgoing * limiter;
+}
 
 @compute @workgroup_size(8, 8)
 fn wet(@builtin(global_invocation_id) invocation: vec3u) {
@@ -34,18 +85,26 @@ fn wet(@builtin(global_invocation_id) invocation: vec3u) {
   var height = state[index].x;
   var light = glow[index];
   var packed = packing[index];
+  if (params.limits.z > 0.5 && inImpactRegion(vec2i(cell))) {
+    var incoming = 0.0;
+    for (var axis = 0u; axis < 4u; axis++) {
+      let neighbor = vec2i(cell) + neighbors[axis];
+      // Scratch outside this dispatch can contain an earlier simulation or
+      // another drop; it must never enter this deposit's local exchange.
+      if (inImpactRegion(neighbor)) { incoming += impactFlux[dropAddress(neighbor)].axial[axis ^ 1u]; }
+    }
+    height += incoming - dot(impactFlux[index].axial, vec4f(1.0));
+  }
   for (var drop = 0u; drop < u32(params.grid.w); drop++) {
-    let shape = params.drops[drop * 2u];
-    let impact = params.drops[drop * 2u + 1u];
+    let shape = params.drops[drop * 3u];
+    let impact = params.drops[drop * 3u + 1u];
+    let start = params.drops[drop * 3u + 2u].xy;
     let offset = position - shape.xy;
     let distanceSquared = dot(offset, offset);
-    let radial = distanceSquared / max(impact.y * impact.y, 1e-12);
-    if (radial < 9.0) { height -= impact.x * (1.0 - radial) * exp(-radial); }
-    let mound = distanceSquared / max(shape.z * shape.z * 0.25, 1e-12);
-    if (mound < 12.0) {
+    if (impact.z > 0.0) {
       // New dry sand mixes into the surface layer by volume before any water
       // the deposit carries is added.
-      let added = impact.z * exp(-mound);
+      let added = impact.z * sweptGaussian(position, start, shape.xy, max(shape.z * 0.5, 1e-6), 12.0);
       height += added;
       wetness *= ${WATER.surfaceLayer} / (${WATER.surfaceLayer} + added);
       // Poured and dripped sand lands loose.
@@ -59,14 +118,14 @@ fn wet(@builtin(global_invocation_id) invocation: vec3u) {
   glow[index] = min(light, 1.5);
   packing[index] = packed;
   moisture[index] = min(wetness, params.limits.x);
-  state[index].x = max(height, params.limits.y);
+  state[index].x = height;
 }
 `
 
-// Runs after integration each substep. Moisture rides with the sand that the
-// conservative flux moved and spreads slowly by capillary diffusion. Water above
-// saturation is a surface film that flows down the water-surface gradient, so it
-// spreads across flats and runs into grooves, then evaporates or soaks in.
+// Runs after integration each substep. Incoming sand mixes into the same local
+// surface layer used by deposits and packing; moisture is a surface composition,
+// not a water inventory for the whole bed column. Capillary diffusion and film
+// runoff then spread that field before drying and groundwater replenishment.
 const hydrateShader = `
 ${fluxLayout}
 struct Params { grid: vec4f, physics: vec4f, tool: vec4f, material: vec4f }
@@ -97,8 +156,7 @@ fn hydrate(@builtin(global_invocation_id) invocation: vec3u) {
   let index = address(cell);
   let wetness = moistureSource[index];
   let height = source[index].x;
-  let remaining = max(0.0, height - totalFlux(flux[index]));
-  var water = wetness * remaining;
+  var water = wetness * ${WATER.surfaceLayer};
   // Packing describes the surface layer. Sand a tool shoves into a cell is
   // compressed and keeps its packing; sand that arrives by flowing on its own
   // (slumping, creeping) tumbles loose. What stays keeps its packing.
@@ -106,7 +164,6 @@ fn hydrate(@builtin(global_invocation_id) invocation: vec3u) {
   let arrival = select(0.5, 1.0, shoved);
   var packed = packingSource[index] * ${WATER.surfaceLayer};
   var layer = ${WATER.surfaceLayer};
-  var carried = remaining;
   var exchange = 0.0;
   let film = surfaceWater(index);
   for (var axis = 0u; axis < 8u; axis++) {
@@ -118,9 +175,8 @@ fn hydrate(@builtin(global_invocation_id) invocation: vec3u) {
     water += amount * otherWetness;
     packed += amount * packingSource[other] * arrival;
     layer += amount;
-    carried += amount;
     if (axis >= 4u) { continue; }
-    // Symmetric per-link exchanges, so every pair agrees and water is conserved.
+    // Symmetric per-link exchanges before saturation clipping and drying.
     // Capillary wicking needs grain contact: cells at very different heights
     // (a castle wall and the beach beside it) touch only at the wall's foot.
     let contact = exp(-abs(height - source[other].x) / 0.002);
@@ -129,7 +185,7 @@ fn hydrate(@builtin(global_invocation_id) invocation: vec3u) {
     let head = (height + film * ${WATER.filmThickness}) - (source[other].x + otherFilm * ${WATER.filmThickness});
     exchange -= clamp(head / ${WATER.filmThickness} * 0.25, -otherFilm * 0.24, film * 0.24);
   }
-  let advected = select(wetness, water / carried, carried > 1e-9);
+  let advected = water / layer;
   let mixed = max(0.0, advected + exchange);
   let damp = min(mixed, 1.0) * exp(-params.grid.w / ${WATER.dampEvaporation.toFixed(1)});
   let standing = max(0.0, mixed - 1.0) * exp(-params.grid.w / ${WATER.filmInfiltration.toFixed(1)});
@@ -177,6 +233,8 @@ export class SandWater {
   private readonly dropData = new Float32Array(dropParamVectors * 4)
   private dropPipeline!: GPUComputePipeline
   private dropGroups: GPUBindGroup[] = []
+  private impactPipeline!: GPUComputePipeline
+  private impactGroups: GPUBindGroup[] = []
   private hydratePipeline!: GPUComputePipeline
   private hydrateGroups: GPUBindGroup[][] = []
 
@@ -197,8 +255,9 @@ export class SandWater {
       checkedShader(this.device, 'Water drops WGSL', dropShader),
       checkedShader(this.device, 'Moisture transport WGSL', hydrateShader),
     ])
-    ;[this.dropPipeline, this.hydratePipeline] = await Promise.all([
+    ;[this.dropPipeline, this.impactPipeline, this.hydratePipeline] = await Promise.all([
       this.device.createComputePipelineAsync({ label: 'Water drops', layout: 'auto', compute: { module: drops, entryPoint: 'wet' } }),
+      this.device.createComputePipelineAsync({ label: 'Conservative water impact', layout: 'auto', compute: { module: drops, entryPoint: 'impact' } }),
       this.device.createComputePipelineAsync({ label: 'Moisture transport', layout: 'auto', compute: { module: hydrate, entryPoint: 'hydrate' } }),
     ])
     this.dropGroups = states.map((state, index) => this.device.createBindGroup({ layout: this.dropPipeline.getBindGroupLayout(0), entries: [
@@ -207,6 +266,12 @@ export class SandWater {
       { binding: 2, resource: { buffer: this.moisture[index] } },
       { binding: 3, resource: { buffer: this.glow } },
       { binding: 4, resource: { buffer: this.packing[index] } },
+      { binding: 5, resource: { buffer: flux } },
+    ] }))
+    this.impactGroups = states.map((state) => this.device.createBindGroup({ layout: this.impactPipeline.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: this.dropUniform } },
+      { binding: 1, resource: { buffer: state } },
+      { binding: 5, resource: { buffer: flux } },
     ] }))
     this.hydrateGroups = uniforms.map((uniform) => states.map((state, index) => this.device.createBindGroup({ layout: this.hydratePipeline.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: uniform } },
@@ -225,24 +290,53 @@ export class SandWater {
   encodeDeposits(encoder: GPUCommandEncoder, drops: readonly Deposit[], current: number) {
     const batch = drops.slice(0, WATER.maxDropsPerFrame)
     if (!batch.length) return false
+    const hasImpact = batch.some((drop) => drop.pit > 0)
     const spacing = SAND.extent / this.resolution
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+    let impactMinX = Infinity, impactMinY = Infinity, impactMaxX = -Infinity, impactMaxY = -Infinity
     this.dropData.fill(0)
     batch.forEach((drop, index) => {
       const reach = Math.max(drop.radius * (drop.sand > 0 ? 1.75 : 1), drop.pit > 0 ? drop.pitRadius * 3 : 0)
-      minX = Math.min(minX, drop.x - reach); maxX = Math.max(maxX, drop.x + reach)
-      minY = Math.min(minY, drop.y - reach); maxY = Math.max(maxY, drop.y + reach)
-      this.dropData.set([drop.x, drop.y, drop.radius, drop.amount, drop.pit, drop.pitRadius, drop.sand, 0], 12 + index * 8)
+      const from = drop.from ?? drop
+      minX = Math.min(minX, drop.x - reach, from.x - reach); maxX = Math.max(maxX, drop.x + reach, from.x + reach)
+      minY = Math.min(minY, drop.y - reach, from.y - reach); maxY = Math.max(maxY, drop.y + reach, from.y + reach)
+      const radiusSquared = Math.max(drop.pitRadius ** 2, 1e-12)
+      const potentialScale = drop.pit * radiusSquared / (4 * spacing ** 2)
+      const potentialReach = 3 * Math.sqrt(radiusSquared) + spacing
+      if (drop.pit > 0) {
+        // Impacts are endpoint events. A simultaneous long swept pour must
+        // not stretch this prepass across its unrelated path.
+        const impactReach = 3 * Math.sqrt(radiusSquared)
+        impactMinX = Math.min(impactMinX, drop.x - impactReach); impactMaxX = Math.max(impactMaxX, drop.x + impactReach)
+        impactMinY = Math.min(impactMinY, drop.y - impactReach); impactMaxY = Math.max(impactMaxY, drop.y + impactReach)
+      }
+      this.dropData.set([drop.x, drop.y, drop.radius, drop.amount, drop.pit, drop.pitRadius, drop.sand, potentialScale,
+        from.x, from.y, 1 / radiusSquared, potentialReach ** 2], 16 + index * 12)
     })
     const toCell = (value: number) => (value + SAND.extent / 2) / spacing - 0.5
+    // The existing one-cell halo includes receivers just outside the pressure
+    // support, so even its truncated tail is exchanged conservatively.
     const x0 = Math.max(0, Math.floor(toCell(minX)) - 1)
     const y0 = Math.max(0, Math.floor(toCell(minY)) - 1)
     const x1 = Math.min(this.resolution, Math.ceil(toCell(maxX)) + 2)
     const y1 = Math.min(this.resolution, Math.ceil(toCell(maxY)) + 2)
     if (x1 <= x0 || y1 <= y0) return false
-    this.dropData.set([this.resolution, spacing, SAND.extent, batch.length, x0, y0, x1 - x0, y1 - y0, WATER.maxMoisture, SAND.floor, 0, 0])
+    const impactX0 = hasImpact ? Math.max(0, Math.floor(toCell(impactMinX)) - 1) : 0
+    const impactY0 = hasImpact ? Math.max(0, Math.floor(toCell(impactMinY)) - 1) : 0
+    const impactX1 = hasImpact ? Math.min(this.resolution, Math.ceil(toCell(impactMaxX)) + 2) : 0
+    const impactY1 = hasImpact ? Math.min(this.resolution, Math.ceil(toCell(impactMaxY)) + 2) : 0
+    const impactWidth = Math.max(0, impactX1 - impactX0)
+    const impactHeight = Math.max(0, impactY1 - impactY0)
+    const activeImpact = impactWidth > 0 && impactHeight > 0
+    this.dropData.set([this.resolution, spacing, SAND.extent, batch.length, x0, y0, x1 - x0, y1 - y0,
+      impactX0, impactY0, impactWidth, impactHeight, WATER.maxMoisture, SAND.floor, activeImpact ? 1 : 0, 0])
     this.device.queue.writeBuffer(this.dropUniform, 0, this.dropData)
     const pass = encoder.beginComputePass({ label: 'Water drops' })
+    if (activeImpact) {
+      pass.setPipeline(this.impactPipeline)
+      pass.setBindGroup(0, this.impactGroups[current])
+      pass.dispatchWorkgroups(Math.ceil(impactWidth / 8), Math.ceil(impactHeight / 8))
+    }
     pass.setPipeline(this.dropPipeline)
     pass.setBindGroup(0, this.dropGroups[current])
     pass.dispatchWorkgroups(Math.ceil((x1 - x0) / 8), Math.ceil((y1 - y0) / 8))

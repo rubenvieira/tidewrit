@@ -1,6 +1,8 @@
 import { SAND } from '../config'
 import { toolFootprints } from '../simulation/footprints'
 import { bedReliefWgsl } from '../simulation/bed-relief'
+import { grainReliefWgsl } from './grain-relief'
+import { particleOpticsWgsl } from './particle-optics'
 
 export const surfaceShader = `
 struct View {
@@ -36,6 +38,8 @@ struct Grain { position: vec4f, velocity: vec4f }
 @group(0) @binding(10) var<storage, read> packingField: array<f32>;
 ${toolFootprints}
 ${bedReliefWgsl}
+${grainReliefWgsl}
+${particleOpticsWgsl}
 fn moistureCell(cell: vec2i) -> f32 {
   let bounded = clamp(cell, vec2i(0), vec2i(i32(view.grid.x) - 1));
   return moistureField[u32(bounded.y) * u32(view.grid.x) + u32(bounded.x)];
@@ -153,6 +157,7 @@ struct GrainAppearance {
   offset: vec2f,
   shapedOffset: vec2f,
   axis: vec2f,
+  aspect: f32,
   color: vec2f,
   materialSeed: vec2f,
   grainCell: vec2f,
@@ -167,6 +172,7 @@ fn grainAppearance(coordinate: vec2f) -> GrainAppearance {
   var grainOffset = vec2f(0.0);
   var shapedOffset = vec2f(0.0);
   var selectedAxis = vec2f(1.0, 0.0);
+  var selectedAspect = 1.0;
   var grainColor = vec2f(0.5);
   var selectedCell = vec2f(0.0);
   for (var row = -1; row <= 1; row++) {
@@ -187,6 +193,7 @@ fn grainAppearance(coordinate: vec2f) -> GrainAppearance {
         grainOffset = offset;
         shapedOffset = local;
         selectedAxis = axis;
+        selectedAspect = aspect;
         grainColor = random;
         selectedCell = cell;
       } else {
@@ -198,7 +205,7 @@ fn grainAppearance(coordinate: vec2f) -> GrainAppearance {
   let materialSeed = hash2(selectedCell + vec2f(87.17, 31.73));
   let rawRoundness = sqrt(max(0.0, 1.0 - min(nearest / 0.44, 1.0)));
   let angularity = mix(rawRoundness, smoothstep(0.04, 0.96, rawRoundness), materialSeed.y * 0.46);
-  return GrainAppearance(grainOffset, shapedOffset, selectedAxis, grainColor, materialSeed, selectedCell,
+  return GrainAppearance(grainOffset, shapedOffset, selectedAxis, selectedAspect, grainColor, materialSeed, selectedCell,
     smoothstep(0.014, 0.145, boundary), angularity);
 }
 struct SandMaterial {
@@ -385,18 +392,21 @@ fn shadeSurface(input: VertexOutput, top: GrainProjection, sideX: GrainProjectio
   let grainEdge = grain.edge;
   let roundness = grain.roundness;
   let heightSeed = fract(grain.materialSeed.x * 3.71 + grain.color.y * 5.17);
-  let grainHeight = depthDetail * grainEdge * roundness * mix(0.000038, 0.000126, heightSeed);
-  let perpendicular = vec2f(-grain.axis.y, grain.axis.x);
-  let radial = grain.axis * grain.shapedOffset.x + perpendicular * grain.shapedOffset.y;
+  let reliefScale = grainReliefScale(film, packedness, kinetic);
+  let grainHeight = depthDetail * grainEdge * roundness * mix(0.000038, 0.000126, heightSeed) * reliefScale;
+  let radial = grainMetricGradient(grain.axis, grain.shapedOffset, grain.aspect);
   let facetJitter = (grain.materialSeed - 0.5) * 0.34;
   let facet = radial * (0.34 + roundness * 0.46) + facetJitter;
   var facetDirection = vec3f(facet.x, 0.0, facet.y);
   if (onSide) { facetDirection = select(vec3f(facet.x, facet.y, 0.0), vec3f(0.0, facet.y, facet.x), facingX); }
   // Steep faces are slightly rough-hewn; packed kinetic faces and wet film stay smooth.
-  let crumble = crumbleGradient(input.world);
-  let crumbleRelief = (crumble - macroNormal * dot(crumble, macroNormal)) * 0.32 * smoothstep(0.25, 0.8, 1.0 - macroNormal.y)
+  let crumbleWeight = 0.32 * smoothstep(0.25, 0.8, 1.0 - macroNormal.y)
     * (1.0 - 0.7 * packedness * kinetic) * (1.0 - film);
-  let grainRelief = facetDirection * appearanceDetail * (1.0 - film * 0.85) * (1.0 - 0.55 * packedness * kinetic);
+  var crumbleRelief = vec3f(0.0);
+  if (crumbleWeight > 0.0) {
+    crumbleRelief = tangentRelief(macroNormal, crumbleGradient(input.world)) * crumbleWeight;
+  }
+  let grainRelief = tangentRelief(macroNormal, facetDirection) * appearanceDetail * reliefScale;
   let normal = normalize(macroNormal + crumbleRelief + grainRelief);
   // The crumble relief stands for unresolved roughness at every scale: it
   // scatters reflections rather than forming a coherent mirror facet, so
@@ -504,12 +514,11 @@ struct GrainOutput {
   let worldPerPixel = 2.0 * view.eye.w * cameraDepth / max(view.grid.w, 1.0);
   let renderRadius = max(physicalRadius, worldPerPixel * 0.72);
   let cameraVelocity = vec2f(dot(grain.velocity.xyz, view.right.xyz), dot(grain.velocity.xyz, view.up.xyz));
-  let projectedSpeed = length(cameraVelocity);
-  let axis = select(vec2f(1.0, 0.0), cameraVelocity / max(projectedSpeed, 1e-8), projectedSpeed > 1e-5);
+  let trail = particleTrail(cameraVelocity, worldPerPixel);
+  let axis = trail.axis;
   let side = vec2f(-axis.y, axis.x);
-  let shutter = 0.0035;
-  let halfTrail = min(projectedSpeed * shutter * 0.5, worldPerPixel * 3.0);
-  let blurCenter = grain.position.xyz - (view.right.xyz * cameraVelocity.x + view.up.xyz * cameraVelocity.y) * shutter * 0.5;
+  let halfTrail = trail.halfLength;
+  let blurCenter = grain.position.xyz + view.right.xyz * trail.centerOffset.x + view.up.xyz * trail.centerOffset.y;
   let extent = renderRadius + halfTrail;
   let cameraOffset = axis * (corner.x * extent) + side * (corner.y * renderRadius);
   let position = blurCenter + view.right.xyz * cameraOffset.x + view.up.xyz * cameraOffset.y;
@@ -535,7 +544,9 @@ struct GrainFragmentOutput { @location(0) color: vec4f, @location(1) glint: f32,
   let sideWorld = view.right.xyz * -input.axis.y + view.up.xyz * input.axis.x;
   let nearest = input.center + axisWorld * (clamp(input.local.x, -input.trailRatio, input.trailRatio) * input.radius);
   let normal = normalize(axisWorld * local.x + sideWorld * local.y - view.forward.xyz * sphereDepth);
-  let surface = nearest + normal * input.radius;
+  // The minimum raster footprint improves sampling, but must not push a
+  // subpixel grain's depth toward the camera or through the bed beneath it.
+  let surface = nearest + normal * input.physicalRadius;
   let light = normalize(view.light.xyz);
   let towardEye = normalize(view.eye.xyz - surface);
   let halfway = normalize(light + towardEye);
@@ -547,7 +558,8 @@ struct GrainFragmentOutput { @location(0) color: vec4f, @location(1) glint: f32,
   let shade = treeShadow(surface.xz);
   let ambient = environment(normal) * 0.34;
   let direct = view.sun.rgb * diffuse * shade;
-  let radiance = albedo * (ambient + direct) + environment(reflect(-towardEye, normal)) * sparkle * 0.55 * smoothstep(0.72, 0.94, shade);
+  let sparkleVisibility = smoothstep(0.72, 0.94, shade);
+  let radiance = albedo * (ambient + direct) + environment(reflect(-towardEye, normal)) * sparkle * 0.55 * sparkleVisibility;
   let physicalArea = 3.141593 * input.physicalRadius * input.physicalRadius;
   let capsuleArea = 3.141593 * input.radius * input.radius + 4.0 * input.radius * (input.trailRatio * input.radius);
   let areaCoverage = clamp(physicalArea / max(capsuleArea, 1e-12), 0.0, 1.0);
@@ -556,7 +568,7 @@ struct GrainFragmentOutput { @location(0) color: vec4f, @location(1) glint: f32,
   let projected = project(surface);
   var output: GrainFragmentOutput;
   output.color = vec4f(radiance * alpha, alpha);
-  output.glint = sparkle * alpha * 0.18;
+  output.glint = sparkle * alpha * 0.18 * particleGlintGain(view.sun.rgb, sparkleVisibility, view.material.x);
   output.depth = projected.z / projected.w;
   return output;
 }

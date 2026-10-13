@@ -1,12 +1,11 @@
 import { FOOT_PRESS_STEPS, GAIT, SAND, SHELL_PRESS_STEPS, SYMMETRIES, TOOL_KIND, TOOL_SHAPE, idleStroke, type ContactTool, type Point, type Stroke, type Symmetry } from '../config'
 import { symmetryImages, transformAngle, transformVector, type SymmetryImage } from './symmetry'
 
-type TimedPoint = Point & { time: number }
+type TimedPoint = Point & { time: number; pressure: number }
 type Track = {
   tool: ContactTool
   radius: number
   held: boolean
-  pressure: number
   start: TimedPoint
   latest: TimedPoint
   latestTime: number | undefined
@@ -26,8 +25,7 @@ const minimumMovement = 1e-7
 // substep and maxSteps per rendered frame, so this caps a pointer at four
 // rendered frames of pending contact work rather than a single frame.
 export const maxQueuedSegmentsPerPointer = SAND.maxContacts * SAND.maxSteps * 4
-// Shell and foot imprints are stationary contacts held for several substeps; at
-// most this many may be pressing at once so ordinary strokes always keep slots.
+// Bound retained stamps independently of their symmetry-expanded frame cost.
 const maxConcurrentPresses = SAND.maxContacts / 2
 type Press = { stroke: Stroke; remaining: number }
 
@@ -35,6 +33,8 @@ export class StrokeQueue {
   private readonly tracks = new Map<number, Track>()
   private readonly presses: Press[] = []
   private roundRobin = 0
+  private pressRoundRobin = 0
+  private preferPress = true
   private currentPressure = 0.7
   position: Point = { x: 0, y: 0 }
   radius: number = SAND.radius
@@ -49,15 +49,14 @@ export class StrokeQueue {
     const bounded = this.bound(point)
     const existing = this.tracks.get(pointerId)
     const timestamp = this.timestamp(existing, time)
-    const start = { ...bounded, time: timestamp }
     this.position = bounded
     this.currentPressure = this.clampPressure(pressure)
+    const start = { ...bounded, time: timestamp, pressure: this.currentPressure }
     if (tool === 'shell') this.press(bounded)
     this.tracks.set(pointerId, {
       tool,
       radius,
       held: true,
-      pressure: this.currentPressure,
       start,
       latest: start,
       latestTime: timestamp,
@@ -74,9 +73,13 @@ export class StrokeQueue {
     const track = this.tracks.get(pointerId)
     if (!track || !track.held) return
     const timestamp = this.timestamp(track, time)
-    track.pressure = this.currentPressure
+    // A release or stationary pressure change belongs to the next motion,
+    // not to the already-traveled tail waiting for the next simulation step.
+    const stationary = Math.hypot(bounded.x - track.latest.x, bounded.y - track.latest.y) <= minimumMovement
+    if (stationary) this.flush(track)
     track.latestTime = timestamp
-    track.latest = { ...bounded, time: timestamp }
+    track.latest = { ...bounded, time: timestamp, pressure: this.currentPressure }
+    if (stationary) { track.start = track.latest; return }
     if (track.tool === 'feet') this.walk(track)
     else if (track.tool !== 'shell') this.subdivide(track)
   }
@@ -96,6 +99,8 @@ export class StrokeQueue {
       this.tracks.clear()
       this.presses.length = 0
       this.roundRobin = 0
+      this.pressRoundRobin = 0
+      this.preferPress = true
       return
     }
     this.tracks.delete(pointerId)
@@ -142,7 +147,10 @@ export class StrokeQueue {
   }
 
   private press(point: Point, tool: 'shell' | 'feet' = 'shell', angle = this.nextShellAngle, variant = 0, radius = this.radius) {
-    if (this.presses.length >= maxConcurrentPresses) this.presses.shift()
+    if (this.presses.length >= maxConcurrentPresses) {
+      this.presses.shift()
+      this.pressRoundRobin = Math.max(0, this.pressRoundRobin - 1)
+    }
     this.presses.push({ remaining: tool === 'feet' ? FOOT_PRESS_STEPS : SHELL_PRESS_STEPS, stroke: {
       from: { ...point }, to: { ...point }, velocity: { x: 0, y: 0 },
       radius: radius * TOOL_SHAPE[tool].reach, pressure: this.toolPressure(tool, 1),
@@ -175,7 +183,7 @@ export class StrokeQueue {
     track.stepFrom = { x: track.latest.x, y: track.latest.y }
   }
 
-  private makeStroke(track: Track, from: TimedPoint, to: TimedPoint, pressure: number): Stroke {
+  private makeStroke(track: Track, from: TimedPoint, to: TimedPoint): Stroke {
     const tool = track.tool
     const rawDuration = (to.time - from.time) / 1000
     // WebKit can deliver coalesced samples with the same timestamp after a
@@ -185,7 +193,7 @@ export class StrokeQueue {
     return {
       from: { x: from.x, y: from.y }, to: { x: to.x, y: to.y },
       velocity: { x: (to.x - from.x) / duration, y: (to.y - from.y) / duration },
-      radius: track.radius * TOOL_SHAPE[tool].reach, pressure: this.toolPressure(tool, pressure),
+      radius: track.radius * TOOL_SHAPE[tool].reach, pressure: this.toolPressure(tool, (from.pressure + to.pressure) * 0.5),
       active: true, kind: TOOL_KIND[tool], angle: tool === 'wind' ? this.windAngle(track, from, to) : 0, variant: 0,
     }
   }
@@ -199,8 +207,9 @@ export class StrokeQueue {
         x: track.start.x + (track.latest.x - track.start.x) * fraction,
         y: track.start.y + (track.latest.y - track.start.y) * fraction,
         time: track.start.time + (track.latest.time - track.start.time) * fraction,
+        pressure: track.start.pressure + (track.latest.pressure - track.start.pressure) * fraction,
       }
-      track.segments.push(this.makeStroke(track, track.start, to, track.pressure))
+      track.segments.push(this.makeStroke(track, track.start, to))
       this.trimBacklog(track)
       track.start = to
       distance = Math.hypot(track.latest.x - track.start.x, track.latest.y - track.start.y)
@@ -210,7 +219,7 @@ export class StrokeQueue {
   private flush(track: Track) {
     const distance = Math.hypot(track.latest.x - track.start.x, track.latest.y - track.start.y)
     if (track.tool !== 'shell' && track.tool !== 'feet' && distance > minimumMovement) {
-      track.segments.push(this.makeStroke(track, track.start, track.latest, track.pressure))
+      track.segments.push(this.makeStroke(track, track.start, track.latest))
       this.trimBacklog(track)
     }
     track.start = track.latest
@@ -234,13 +243,27 @@ export class StrokeQueue {
     const images = symmetryImages(this.symmetry)
     const result: Stroke[] = []
     const take = (stroke: Stroke) => { for (const image of images) result.push(images.length > 1 ? this.image(stroke, image) : stroke) }
-    for (const press of this.presses) {
-      if (result.length + images.length > limit) break
+    const entries = [...this.tracks.entries()]
+    const groups = Math.floor(limit / images.length)
+    const pendingMotion = entries.reduce((count, [, track]) => count + track.segments.length, 0)
+    // Reserve complete symmetry groups for moving contacts, including their
+    // released tails. More stamps can fit when there is less motion to serve.
+    let pressBudget = groups - Math.min(Math.ceil(groups / 2), pendingMotion)
+    if (groups === 1 && pendingMotion > 0 && this.presses.length > 0) {
+      // The legacy single-contact consumer also gives both classes a turn.
+      pressBudget = Number(this.preferPress)
+      this.preferPress = !this.preferPress
+    }
+    const count = Math.min(this.presses.length, pressBudget)
+    const start = this.pressRoundRobin % Math.max(1, this.presses.length)
+    const nextPress = count < this.presses.length ? this.presses[(start + count) % this.presses.length] : undefined
+    for (let offset = 0; offset < count; offset++) {
+      const press = this.presses[(start + offset) % this.presses.length]
       take(press.stroke)
       press.remaining--
     }
     for (let index = this.presses.length - 1; index >= 0; index--) if (this.presses[index].remaining <= 0) this.presses.splice(index, 1)
-    const entries = [...this.tracks.entries()]
+    this.pressRoundRobin = nextPress ? this.presses.indexOf(nextPress) : 0
     if (!entries.length) return result
     let emptyPasses = 0
     let cursor = this.roundRobin % entries.length

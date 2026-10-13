@@ -1,41 +1,44 @@
 import { DIG, KINETIC, MOLD, SAND, WATER, type Point } from '../config'
 import { checkedShader } from '../platform/shader'
 import { toolFootprints } from './footprints'
+import { sweptKernels } from './swept-kernels'
 
-export type DigOp = { x: number; y: number; radius: number; volume: number; spoil: Point; spoilRadius: number; wetness: number }
+export type DigOp = { x: number; y: number; radius: number; volume: number; spoil: Point; spoilRadius: number; wetness: number; from?: Point; spoilFrom?: Point }
 export type MoldOp = { x: number; y: number; radius: number; angle: number; shape: number; wetness: number }
 
 // Sand below this height above the floor is never dug, so a scoop that reaches
 // the bottom just stops removing sand there.
 const floorMargin = 0.002
-const spacing = SAND.extent / SAND.resolution
 const headerVectors = 5
-const uniformVectors = headerVectors + DIG.maxPerFrame * 3 + MOLD.maxPerFrame * 2
+const uniformVectors = headerVectors + DIG.maxPerFrame * 4 + MOLD.maxPerFrame * 2
 
 // Digging is two passes. `excavate` removes a bowl-shaped scoop
 // (1 - r²/R²)², limited by the sand actually present, and sums what each dig
 // removed in fixed point. `spoil` spreads exactly that total over a truncated
-// Gaussian heap, whose discrete normalization the CPU computes over the same
-// cells, so digging conserves sand to rounding regardless of where a scoop
+// Gaussian heap, whose discrete normalization the excavation pass computes
+// over the same cells, so digging conserves sand to rounding regardless of where a scoop
 // bottoms out. Molds raise packed damp sand to the ground level under their
 // center plus their shape.
 const earthworksShader = `
 ${toolFootprints}
+${sweptKernels}
 struct Earthworks {
   grid: vec4f,
   digRegion: vec4f,
   spoilRegion: vec4f,
   moldRegion: vec4f,
   counts: vec4f,
-  digs: array<vec4f, ${DIG.maxPerFrame * 3}>,
+  digs: array<vec4f, ${DIG.maxPerFrame * 4}>,
   molds: array<vec4f, ${MOLD.maxPerFrame * 2}>,
 }
 @group(0) @binding(0) var<uniform> params: Earthworks;
 @group(0) @binding(1) var<storage, read_write> state: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> moisture: array<f32>;
-@group(0) @binding(3) var<storage, read_write> dug: array<atomic<i32>, ${DIG.maxPerFrame}>;
+@group(0) @binding(3) var<storage, read_write> dug: array<atomic<u32>, ${DIG.maxPerFrame * 2}>;
 @group(0) @binding(4) var<storage, read_write> moldGround: array<f32, ${MOLD.maxPerFrame}>;
 @group(0) @binding(5) var<storage, read_write> packing: array<f32>;
+var<workgroup> removedByGroup: array<atomic<u32>, ${DIG.maxPerFrame}>;
+var<workgroup> weightsByGroup: array<atomic<u32>, ${DIG.maxPerFrame}>;
 
 fn cellIn(region: vec4f, invocation: vec3u) -> vec3i {
   if (f32(invocation.x) >= region.z || f32(invocation.y) >= region.w) { return vec3i(-1); }
@@ -49,22 +52,39 @@ fn positionOf(cell: vec2i) -> vec2f {
 }
 
 @compute @workgroup_size(8, 8)
-fn excavate(@builtin(global_invocation_id) invocation: vec3u) {
-  let cell = cellIn(params.digRegion, invocation);
-  if (cell.z < 0) { return; }
-  let position = positionOf(cell.xy);
-  var height = state[cell.z].x;
-  for (var dig = 0u; dig < u32(params.counts.x); dig++) {
-    let scoop = params.digs[dig * 3u];
-    let offset = position - scoop.xy;
-    let fraction = dot(offset, offset) / max(scoop.z * scoop.z, 1e-12);
-    if (fraction >= 1.0) { continue; }
-    let request = scoop.w * (1.0 - fraction) * (1.0 - fraction);
-    let units = i32(floor(min(request, max(0.0, height - params.grid.w)) * 1e9));
-    height -= f32(units) * 1e-9;
-    atomicAdd(&dug[dig], units);
+fn excavate(@builtin(global_invocation_id) invocation: vec3u, @builtin(local_invocation_index) local: u32) {
+  if (local < ${DIG.maxPerFrame}u) {
+    atomicStore(&removedByGroup[local], 0u);
+    atomicStore(&weightsByGroup[local], 0u);
   }
-  state[cell.z].x = height;
+  workgroupBarrier();
+  let cell = cellIn(params.digRegion, invocation);
+  if (cell.z >= 0) {
+    let position = positionOf(cell.xy);
+    var height = state[cell.z].x;
+    for (var dig = 0u; dig < u32(params.counts.x); dig++) {
+      let scoop = params.digs[dig * 4u];
+      let origin = params.digs[dig * 4u + 2u].yz;
+      let request = scoop.w * sweptBowl(position, origin, scoop.xy, max(scoop.z, 1e-6));
+      let heightScale = params.digs[dig * 4u + 3u].z;
+      let units = u32(floor(min(request, max(0.0, height - params.grid.w)) * heightScale));
+      height -= f32(units) / heightScale;
+      if (units > 0u) { atomicAdd(&removedByGroup[dig], units); }
+      let heap = params.digs[dig * 4u + 1u];
+      let start = params.digs[dig * 4u + 3u].xy;
+      let weight = sweptGaussian(position, start, heap.xy, max(heap.z, 1e-6), 9.0);
+      let weightUnits = u32(round(weight * heap.w));
+      if (weightUnits > 0u) { atomicAdd(&weightsByGroup[dig], weightUnits); }
+    }
+    state[cell.z].x = height;
+  }
+  workgroupBarrier();
+  // Only one lane publishes each 8x8 group's totals. No invocation returns
+  // before the barriers, including partial groups at the dispatch boundary.
+  if (local < u32(params.counts.x)) {
+    atomicAdd(&dug[local], atomicLoad(&removedByGroup[local]));
+    atomicAdd(&dug[local + ${DIG.maxPerFrame}u], atomicLoad(&weightsByGroup[local]));
+  }
 }
 
 @compute @workgroup_size(8, 8)
@@ -76,14 +96,17 @@ fn spoil(@builtin(global_invocation_id) invocation: vec3u) {
   var wetness = moisture[cell.z];
   var packed = packing[cell.z];
   for (var dig = 0u; dig < u32(params.counts.x); dig++) {
-    let heap = params.digs[dig * 3u + 1u];
-    let offset = position - heap.xy;
-    let spread = dot(offset, offset) / max(heap.z * heap.z, 1e-12);
-    if (spread >= 9.0) { continue; }
-    let added = f32(atomicLoad(&dug[dig])) * 1e-9 * exp(-spread) * heap.w;
+    let heap = params.digs[dig * 4u + 1u];
+    let origin = params.digs[dig * 4u + 3u].xy;
+    let weight = sweptGaussian(position, origin, heap.xy, max(heap.z, 1e-6), 9.0);
+    let weightUnits = u32(round(weight * heap.w));
+    let totalWeight = atomicLoad(&dug[dig + ${DIG.maxPerFrame}u]);
+    if (weightUnits == 0u || totalWeight == 0u) { continue; }
+    let heightScale = params.digs[dig * 4u + 3u].z;
+    let added = (f32(atomicLoad(&dug[dig])) / heightScale) * (f32(weightUnits) / f32(totalWeight));
     height += added;
     // Loose spoil mixes into the surface layer by volume.
-    wetness = (wetness * ${WATER.surfaceLayer} + params.digs[dig * 3u + 2u].x * added) / (${WATER.surfaceLayer} + added);
+    wetness = (wetness * ${WATER.surfaceLayer} + params.digs[dig * 4u + 2u].x * added) / (${WATER.surfaceLayer} + added);
     packed = (packed * ${WATER.surfaceLayer} + ${KINETIC.loosePacking} * added) / (${WATER.surfaceLayer} + added);
   }
   state[cell.z].x = height;
@@ -134,27 +157,13 @@ type Region = [number, number, number, number]
 /** Exact cell bounds of a disk, clamped to the grid. */
 function region(boxes: { x: number; y: number; reach: number }[], resolution: number): Region {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
-  const toCell = (value: number) => (value + SAND.extent / 2) / spacing - 0.5
+  const toCell = (value: number) => (value + SAND.extent / 2) / (SAND.extent / resolution) - 0.5
   for (const box of boxes) {
     x0 = Math.min(x0, Math.floor(toCell(box.x - box.reach)) - 1); x1 = Math.max(x1, Math.ceil(toCell(box.x + box.reach)) + 2)
     y0 = Math.min(y0, Math.floor(toCell(box.y - box.reach)) - 1); y1 = Math.max(y1, Math.ceil(toCell(box.y + box.reach)) + 2)
   }
   x0 = Math.max(0, x0); y0 = Math.max(0, y0); x1 = Math.min(resolution, x1); y1 = Math.min(resolution, y1)
   return [x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0)]
-}
-
-/** Inverse of the truncated Gaussian's sum over the cells the spoil pass visits. */
-export function spoilNormalization(center: Point, sigma: number, area: Region) {
-  let sum = 0
-  for (let row = area[1]; row < area[1] + area[3]; row++) {
-    const dy = (row + 0.5) * spacing - SAND.extent / 2 - center.y
-    for (let column = area[0]; column < area[0] + area[2]; column++) {
-      const dx = (column + 0.5) * spacing - SAND.extent / 2 - center.x
-      const spread = (dx * dx + dy * dy) / (sigma * sigma)
-      if (spread < 9) sum += Math.exp(-spread)
-    }
-  }
-  return sum > 0 ? 1 / sum : 0
 }
 
 export class SandEarthworks {
@@ -175,7 +184,7 @@ export class SandEarthworks {
     this.moisture = moisture
     this.packing = packing
     this.uniform = device.createBuffer({ label: 'Earthworks', size: this.data.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
-    this.dug = device.createBuffer({ label: 'Dug volume', size: DIG.maxPerFrame * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
+    this.dug = device.createBuffer({ label: 'Dug volume and spoil weights', size: DIG.maxPerFrame * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })
     this.moldGround = device.createBuffer({ label: 'Mold ground levels', size: MOLD.maxPerFrame * 4, usage: GPUBufferUsage.STORAGE })
   }
 
@@ -205,19 +214,27 @@ export class SandEarthworks {
     const digBatch = digs.filter((dig) => dig.volume > 0).slice(0, DIG.maxPerFrame)
     const moldBatch = molds.slice(0, MOLD.maxPerFrame)
     if (!digBatch.length && !moldBatch.length) return false
-    const digRegion = region(digBatch.map((dig) => ({ x: dig.x, y: dig.y, reach: dig.radius })), this.resolution)
-    const spoilRegion = region(digBatch.map((dig) => ({ x: dig.spoil.x, y: dig.spoil.y, reach: dig.spoilRadius * 3 })), this.resolution)
+    const spoilBounds = (dig: DigOp) => [dig.spoil, dig.spoilFrom ?? dig.spoil].map((point) => ({ ...point, reach: dig.spoilRadius * 3 }))
+    const digRegion = region(digBatch.flatMap((dig) => [...[dig, dig.from ?? dig].map((point) => ({ ...point, reach: dig.radius })), ...spoilBounds(dig)]), this.resolution)
+    const spoilRegion = region(digBatch.flatMap(spoilBounds), this.resolution)
     const moldRegion = region(moldBatch.map((mold) => ({ x: mold.x, y: mold.y, reach: mold.radius * 1.42 })), this.resolution)
     this.data.fill(0)
-    this.data.set([this.resolution, spacing, SAND.extent, SAND.floor + floorMargin, ...digRegion, ...spoilRegion, ...moldRegion, digBatch.length, moldBatch.length, 0, 0])
+    const cellSize = SAND.extent / this.resolution
+    this.data.set([this.resolution, cellSize, SAND.extent, SAND.floor + floorMargin, ...digRegion, ...spoilRegion, ...moldRegion, digBatch.length, moldBatch.length, 0, 0])
     digBatch.forEach((dig, index) => {
       // The bowl (1 - r²/R²)² holds π·R²/3 of volume per unit peak depth.
       const peak = dig.volume / (Math.PI * dig.radius * dig.radius / 3)
-      const offset = (headerVectors + index * 3) * 4
-      this.data.set([dig.x, dig.y, dig.radius, peak, dig.spoil.x, dig.spoil.y, dig.spoilRadius, spoilNormalization(dig.spoil, dig.spoilRadius, spoilRegion), dig.wetness, 0, 0, 0], offset)
+      const offset = (headerVectors + index * 4) * 4
+      const from = dig.from ?? dig, spoilFrom = dig.spoilFrom ?? dig.spoil
+      // Quantized weights use the identical integer numerator and denominator
+      // on GPU. Scale down large heaps/scoops to keep each total near 1e9,
+      // safely below u32 overflow even at the largest tool size after a stall.
+      const weightScale = Math.min(1e7, 1e9 / Math.max(1, Math.PI * dig.spoilRadius ** 2 / cellSize ** 2))
+      const heightScale = Math.min(1e9, 1e9 / Math.max(1, dig.volume / cellSize ** 2))
+      this.data.set([dig.x, dig.y, dig.radius, peak, dig.spoil.x, dig.spoil.y, dig.spoilRadius, weightScale, dig.wetness, from.x, from.y, 0, spoilFrom.x, spoilFrom.y, heightScale, 0], offset)
     })
     moldBatch.forEach((mold, index) => {
-      this.data.set([mold.x, mold.y, mold.radius, mold.angle, mold.shape, mold.wetness, 0, 0], (headerVectors + DIG.maxPerFrame * 3 + index * 2) * 4)
+      this.data.set([mold.x, mold.y, mold.radius, mold.angle, mold.shape, mold.wetness, 0, 0], (headerVectors + DIG.maxPerFrame * 4 + index * 2) * 4)
     })
     this.device.queue.writeBuffer(this.uniform, 0, this.data)
     const dispatch = (pass: GPUComputePassEncoder, name: 'excavate' | 'spoil' | 'mold', area: Region) => {

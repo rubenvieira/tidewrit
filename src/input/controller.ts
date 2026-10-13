@@ -63,7 +63,7 @@ export class InputController {
       return camera.screenToBed(event.clientX - rect.left, event.clientY - rect.top, rect.width, rect.height)
     }
     const pressure = (event: PointerEvent) => event.pointerType === 'pen' ? event.pressure : 0.75
-    const eventTimelineTime = (event: PointerEvent) => event.timeStamp > performance.timeOrigin ? event.timeStamp - performance.timeOrigin : event.timeStamp
+    const eventTimelineTime = (event: Event) => event.timeStamp > performance.timeOrigin ? event.timeStamp - performance.timeOrigin : event.timeStamp
     const isOlderThanCurrentPointer = (event: PointerEvent) => {
       const startedAt = this.pointerStartedAt.get(event.pointerId)
       if (startedAt === undefined) return false
@@ -136,11 +136,12 @@ export class InputController {
         }
         if (this.diggingPointers.has(event.pointerId)) {
           this.strokes.position = position(sample)
-          this.earthworks.moveDig(this.strokes.position, event.pointerId)
+          this.earthworks.moveDig(this.strokes.position, event.pointerId, eventTimelineTime(sample))
           sound.movePointer(sample, event.pointerId)
           continue
         }
-        if (this.pointers.has(event.pointerId) && this.tool === 'mold') { this.strokes.position = position(sample); continue }
+        // The queue retains the tool chosen when this contact began. A bucket
+        // gesture has no track, so it only updates the cursor here.
         this.strokes.move(position(sample), pressure(sample), eventTimelineTime(sample), event.pointerId)
         sound.movePointer(sample, event.pointerId)
       }
@@ -154,12 +155,15 @@ export class InputController {
       if (isOlderThanCurrentPointer(event)) return
       if (!this.interactive && !this.pointers.has(event.pointerId)) return
       if (!this.pointers.has(event.pointerId)) return
-      if (this.diggingPointers.delete(event.pointerId)) this.earthworks.endDig(event.pointerId)
+      if (this.diggingPointers.delete(event.pointerId)) {
+        this.earthworks.moveDig(position(event), event.pointerId, eventTimelineTime(event))
+        this.earthworks.endDig(event.pointerId, eventTimelineTime(event))
+      }
       const deposit = this.depositPointers.get(event.pointerId)
       if (deposit) {
         this.depositPointers.delete(event.pointerId)
         this.moveDeposit(deposit, position(event), eventTimelineTime(event), event.pointerId)
-        this.endDeposit(deposit, event.pointerId)
+        this.endDeposit(deposit, event.pointerId, eventTimelineTime(event))
         this.pointers.delete(event.pointerId)
         this.pointerStartedAt.delete(event.pointerId)
         if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId)
@@ -211,34 +215,39 @@ export class InputController {
     window.addEventListener('blur', () => cancelAll(), { signal })
     document.addEventListener('visibilitychange', () => { if (document.hidden) cancelAll() }, { signal })
     const selectTool = (tool: Tool) => {
+      if (!this.interactive) return
       this.tool = tool
       if (!isDepositTool(tool) && !isEarthTool(tool)) this.strokes.tool = tool
       for (const button of ui.tools) button.setAttribute('aria-checked', String(button.dataset.tool === tool))
       this.showPointer = true
-      ui.molds.hidden = tool !== 'mold'
-      if (tool === 'mold') placeAboveToolbar(ui.molds)
-    }
-    const placeAboveToolbar = (element: HTMLElement) => {
-      const toolbar = document.querySelector('.toolbar')?.getBoundingClientRect()
-      if (toolbar) element.style.bottom = `${Math.round(window.innerHeight - toolbar.top + 10)}px`
+      ui.controls.syncTool(tool)
+      if (!ui.controls.navigatingRadios) {
+        if (tool === 'mold') ui.controls.openPanel('molds')
+        else ui.controls.closePanels()
+      }
     }
     for (const button of ui.moldButtons) {
       button.addEventListener('click', () => {
+        if (!this.interactive) return
         this.earthworks.selectShape(button.dataset.mold as MoldShape)
         for (const other of ui.moldButtons) other.setAttribute('aria-checked', String(other === button))
         this.showPointer = true
-        canvas.focus({ preventScroll: true })
+        ui.controls.syncRadios()
+        if (!ui.controls.navigatingRadios) { ui.controls.closePanels(); canvas.focus({ preventScroll: true }) }
       }, { signal })
     }
     const setSize = (millimetres: number) => {
+      if (!this.interactive) return
       ui.radius.value = String(millimetres)
       this.strokes.radius = Number(ui.radius.value) / 1000
       this.water.size = this.strokes.radius
       this.pourer.size = this.strokes.radius
       this.earthworks.size = this.strokes.radius
+      ui.controls.syncSize()
       this.showPointer = true
     }
     const cycleSymmetry = () => {
+      if (!this.interactive) return
       this.symmetryIndex = (this.symmetryIndex + 1) % SYMMETRIES.length
       const symmetry = SYMMETRIES[this.symmetryIndex]
       this.strokes.symmetry = symmetry
@@ -251,6 +260,8 @@ export class InputController {
     }
     const toggleZen = () => {
       if (!this.interactive) return
+      ui.controls.closePanels()
+      canvas.focus({ preventScroll: true })
       if (this.autopilot.active) { this.autopilot.stop(); return }
       const pattern = GARDEN_PATTERNS[this.patternIndex++ % GARDEN_PATTERNS.length]
       const view = this.gardenBounds()
@@ -260,27 +271,16 @@ export class InputController {
       this.actions.push('capture')
       this.autopilot.start(gardenPaths(pattern, bounds, reach), { tool: 'rake', radius: reach / TOOL_SHAPE.rake.reach, speed: AUTOPILOT_SPEED }, performance.now())
     }
-    const placeWriter = () => placeAboveToolbar(ui.writer)
-    const closeWriter = () => {
-      if (ui.writer.hidden) return
-      ui.writer.hidden = true
-      ui.write.setAttribute('aria-expanded', 'false')
-      if (this.tool === 'mold') { ui.molds.hidden = false; placeAboveToolbar(ui.molds) }
-    }
+    const closeWriter = () => ui.controls.closePanels()
     const openWriter = () => {
-      if (!this.interactive) return
-      placeWriter()
-      ui.molds.hidden = true
-      ui.writer.hidden = false
-      ui.write.setAttribute('aria-expanded', 'true')
-      ui.message.focus()
-      ui.message.select()
+      if (this.interactive) ui.controls.openPanel('writer')
     }
     const write = () => {
       const message = normalizeMessage(ui.message.value)
+      if (!this.interactive) return
+      if (!message) { ui.controls.announce('Try a few letters, numbers, or <3 for a heart.'); return }
       closeWriter()
       canvas.focus({ preventScroll: true })
-      if (!this.interactive || !message) return
       const { paths, capHeight } = letteringPaths(message, this.gardenBounds())
       if (!paths.length) return
       this.actions.push('capture')
@@ -289,37 +289,36 @@ export class InputController {
     }
     ui.write.addEventListener('click', () => (ui.writer.hidden ? openWriter() : closeWriter()), { signal })
     ui.writer.addEventListener('submit', (event) => { event.preventDefault(); write() }, { signal })
-    ui.message.addEventListener('keydown', (event) => { if (event.key === 'Escape') { closeWriter(); canvas.focus({ preventScroll: true }) } }, { signal })
-    window.addEventListener('resize', () => {
-      if (!ui.writer.hidden) placeWriter()
-      if (!ui.molds.hidden) placeAboveToolbar(ui.molds)
+    ui.message.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') { event.preventDefault(); ui.controls.closePanels(true) }
     }, { signal })
     const chooseMaterial = (id: string) => {
+      if (!this.interactive) return
       this.material = MATERIALS.find((material) => material.id === id) ?? MATERIALS[0]
       for (const button of ui.materialButtons) button.setAttribute('aria-checked', String(button.dataset.material === this.material.id))
       ui.material.querySelector('b')!.textContent = this.material.label
       ui.material.setAttribute('aria-label', `Sand: ${this.material.label}`)
+      ui.controls.syncRadios()
     }
     const cycleMaterial = () => {
       const index = MATERIALS.findIndex((material) => material.id === this.material.id)
       chooseMaterial(MATERIALS[(index + 1) % MATERIALS.length].id)
     }
     const toggleMaterials = () => {
-      const opening = ui.materials.hidden
-      ui.materials.hidden = !opening
-      ui.material.setAttribute('aria-expanded', String(opening))
-      if (opening) { closeWriter(); ui.molds.hidden = true; placeAboveToolbar(ui.materials) }
-      else if (this.tool === 'mold') ui.molds.hidden = false
+      if (!this.interactive) return
+      if (ui.materials.hidden) ui.controls.openPanel('materials')
+      else ui.controls.closePanels()
     }
     for (const button of ui.materialButtons) {
       button.addEventListener('click', () => {
+        if (!this.interactive) return
         chooseMaterial(button.dataset.material!)
-        toggleMaterials()
-        canvas.focus({ preventScroll: true })
+        if (!ui.controls.navigatingRadios) { ui.controls.openPanel('scene') }
       }, { signal })
     }
     ui.material.addEventListener('click', toggleMaterials, { signal })
     const cycleDaylight = () => {
+      if (!this.interactive) return
       const preset = this.daylight.next(performance.now())
       ui.light.querySelector('b')!.textContent = preset.label
       ui.light.setAttribute('aria-label', `Time of day: ${preset.label}`)
@@ -330,9 +329,12 @@ export class InputController {
       this.autopilot.stop()
       this.actions.push(action)
     }
-    const save = () => { if (!this.actions.includes('save')) this.actions.push('save') }
+    const save = () => { if (this.interactive && !ui.save.disabled && !this.actions.includes('save')) this.actions.push('save') }
     for (const button of ui.tools) {
-      button.addEventListener('click', () => { selectTool(button.dataset.tool as Tool); canvas.focus({ preventScroll: true }) }, { signal })
+      button.addEventListener('click', () => {
+        selectTool(button.dataset.tool as Tool)
+        if (this.interactive && this.tool !== 'mold' && !ui.controls.navigatingRadios) canvas.focus({ preventScroll: true })
+      }, { signal })
     }
     ui.radius.addEventListener('input', () => setSize(Number(ui.radius.value)), { signal })
     ui.symmetry.addEventListener('click', cycleSymmetry, { signal })
@@ -344,7 +346,7 @@ export class InputController {
     ui.reset.addEventListener('click', () => { if (!this.interactive) return; cancelAll(true); reset() }, { signal })
     window.addEventListener('keydown', (event) => {
       // Typing a message keeps its own shortcuts, including Ctrl/⌘ Z.
-      if (event.defaultPrevented || event.altKey || (event.target instanceof HTMLInputElement && event.target.type !== 'range')) return
+      if (!this.interactive || event.defaultPrevented || event.altKey || (event.target instanceof HTMLInputElement && event.target.type !== 'range')) return
       const key = event.key.toLowerCase()
       const command = event.ctrlKey || event.metaKey
       if (command && key === 'z') { event.preventDefault(); history(event.shiftKey ? 'redo' : 'undo'); return }
@@ -352,7 +354,10 @@ export class InputController {
       if (command && key === 's') { event.preventDefault(); save(); return }
       if (command || event.repeat) return
       const shortcutTool = TOOLS.find((tool) => TOOL_KEYS[tool] === key)
-      if (shortcutTool) selectTool(shortcutTool)
+      if (shortcutTool) {
+        selectTool(shortcutTool)
+        if (shortcutTool !== 'mold') canvas.focus({ preventScroll: true })
+      }
       else if (key === 't') cycleMaterial()
       else if (key === 'm') cycleSymmetry()
       else if (key === 'g') toggleZen()
@@ -361,6 +366,7 @@ export class InputController {
       else if (key === 'w') { event.preventDefault(); openWriter() }
     }, { signal })
     canvas.addEventListener('keydown', (event) => {
+      if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return
       if (event.key.toLowerCase() === 'r') { if (!this.interactive) return; cancelAll(true); reset() }
       if (!this.interactive) return
       if (event.code === 'Space') {
@@ -369,12 +375,12 @@ export class InputController {
           if (!this.pointers.size) this.actions.push('capture')
           if (isDepositTool(this.tool)) {
             this.depositPointers.set(keyboardPointerId, this.tool)
-            this.beginDeposit(this.tool, this.strokes.position, event.timeStamp, keyboardPointerId)
+            this.beginDeposit(this.tool, this.strokes.position, eventTimelineTime(event), keyboardPointerId)
           } else if (this.tool === 'dig') {
             this.diggingPointers.add(keyboardPointerId)
-            this.earthworks.beginDig(this.strokes.position, event.timeStamp, keyboardPointerId)
+            this.earthworks.beginDig(this.strokes.position, eventTimelineTime(event), keyboardPointerId)
           } else if (this.tool === 'mold') this.earthworks.placeMold(this.strokes.position)
-          else this.strokes.begin(this.strokes.position, 0.75, event.timeStamp, keyboardPointerId)
+          else this.strokes.begin(this.strokes.position, 0.75, eventTimelineTime(event), keyboardPointerId)
           this.keyboardDrawing = true
         }
       }
@@ -386,24 +392,27 @@ export class InputController {
         const next = { x: this.strokes.position.x + direction[0] * 0.003, y: this.strokes.position.y + direction[1] * 0.003 }
         this.heading = { x: direction[0], y: direction[1] }
         const deposit = this.depositPointers.get(keyboardPointerId)
-        if (deposit || isDepositTool(this.tool) || isEarthTool(this.tool)) {
+        if (deposit || this.diggingPointers.has(keyboardPointerId)) {
           this.strokes.position = next
-          if (deposit) this.moveDeposit(deposit, next, event.timeStamp, keyboardPointerId)
-          if (this.diggingPointers.has(keyboardPointerId)) this.earthworks.moveDig(next, keyboardPointerId)
-        } else this.strokes.move(next, 0.75, event.timeStamp, keyboardPointerId)
+          if (deposit) this.moveDeposit(deposit, next, eventTimelineTime(event), keyboardPointerId)
+          if (this.diggingPointers.has(keyboardPointerId)) this.earthworks.moveDig(next, keyboardPointerId, eventTimelineTime(event))
+        } else this.strokes.move(next, 0.75, eventTimelineTime(event), keyboardPointerId)
       }
       if (event.key === '[' || event.key === ']') setSize(Number(ui.radius.value) + (event.key === '[' ? -1 : 1))
     }, { signal })
-    canvas.addEventListener('keyup', (event) => {
-      if (event.code === 'Space') {
-        const deposit = this.depositPointers.get(keyboardPointerId)
-        this.depositPointers.delete(keyboardPointerId)
-        if (this.diggingPointers.delete(keyboardPointerId)) this.earthworks.endDig(keyboardPointerId)
-        else if (deposit) this.endDeposit(deposit, keyboardPointerId)
-        else this.strokes.end(keyboardPointerId)
-        this.keyboardDrawing = false
-      }
-    }, { signal })
+    const endKeyboardDrawing = (time = performance.now()) => {
+      if (!this.keyboardDrawing) return
+      const deposit = this.depositPointers.get(keyboardPointerId)
+      this.depositPointers.delete(keyboardPointerId)
+      if (this.diggingPointers.delete(keyboardPointerId)) this.earthworks.endDig(keyboardPointerId, time)
+      else if (deposit) this.endDeposit(deposit, keyboardPointerId, time)
+      else this.strokes.end(keyboardPointerId)
+      this.keyboardDrawing = false
+    }
+    canvas.addEventListener('keyup', (event) => { if (event.code === 'Space') endKeyboardDrawing(eventTimelineTime(event)) }, { signal })
+    // Tab, a toolbar click, or the writer can move focus before Space is
+    // released. Its keyup then belongs to another element, so release here.
+    canvas.addEventListener('blur', () => endKeyboardDrawing(), { signal })
   }
 
   setInteractive(interactive: boolean) {
@@ -447,12 +456,12 @@ export class InputController {
 
   private moveDeposit(tool: DepositTool, point: Point, time: number, pointerId: number) {
     if (tool === 'water') this.water.move(point, time, pointerId)
-    else this.pourer.move(point, pointerId)
+    else this.pourer.move(point, pointerId, time)
   }
 
-  private endDeposit(tool: DepositTool, pointerId: number) {
+  private endDeposit(tool: DepositTool, pointerId: number, time?: number) {
     if (tool === 'water') this.water.end(pointerId)
-    else this.pourer.end(pointerId)
+    else this.pourer.end(pointerId, time)
   }
 
   /** The cursor and footprint outline for the active tool, if it should be drawn. */

@@ -1,86 +1,85 @@
-import { MATERIALS, MOLDS, SYMMETRIES, TOOLS, TOOL_KEYS, type Tool } from '../config'
+import { MATERIALS, MOLDS, SYMMETRIES, TOOLS } from '../config'
 import { DAYLIGHTS } from '../render/daylight'
+import { InterfaceControls } from './controls'
+import { icon, shortcut, toolIcons, toolLabels, toolTitles } from './tools'
 
+export type InterfaceNodes = ReturnType<typeof createElements>
 export type InterfaceElements = ReturnType<typeof createInterface>
 
-const toolLabels: Record<Tool, string> = {
-  finger: 'Finger', knife: 'Knife', rake: 'Rake', broom: 'Broom', smooth: 'Smooth', wind: 'Wind',
-  shell: 'Shell', feet: 'Feet', dig: 'Dig', mold: 'Bucket', pour: 'Pour', drip: 'Drip', water: 'Water',
-}
-const toolTitles: Record<Tool, string> = {
-  finger: 'Draw with a fingertip',
-  knife: 'Slice cleanly through anything',
-  rake: 'Comb parallel grooves',
-  broom: 'Sweep fine streaks',
-  smooth: 'Level the sand with a flat blade',
-  wind: 'Brush an area to grow wind ripples',
-  shell: 'Tap to press a scallop shell',
-  feet: 'Drag to walk footprints, tap for one',
-  dig: 'Hold to dig a hole, drag to dig a trench',
-  mold: 'Tap to turn out a bucket mold',
-  pour: 'Hold to pour a stream of dry sand',
-  drip: 'Hold to drip wet sand into castles',
-  water: 'Tap to splash, drag to pour, flick to throw water',
-}
-const icon = (path: string) => `<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">${path}</svg>`
-const toolIcons: Record<Tool, string> = {
-  finger: icon('<path d="M9.5 21v-9.5a1.75 1.75 0 0 1 3.5 0V15l3.6.9a2 2 0 0 1 1.4 2.4L17.2 21"/><path d="M7 7.5a4.5 4.5 0 0 1 8.5-2"/>'),
-  knife: icon('<path d="M4 20 15.5 8.5l3 3L7 23"/><path d="M15.5 8.5 19.5 4.5a2.1 2.1 0 0 1 3 3l-4 4"/>'),
-  rake: icon('<path d="M12 3v8M5 11h14M5 11v6M8.5 11v6M12 11v6M15.5 11v6M19 11v6"/>'),
-  broom: icon('<path d="M12 3v8M8 11h8l2.5 9h-13z"/><path d="M9.5 15v5M12 15v5M14.5 15v5"/>'),
-  smooth: icon('<path d="M3.5 17h12l5-4h-12z"/><path d="M13 13V7.5a2 2 0 0 1 2-2h1.5"/>'),
-  wind: icon('<path d="M3 8.5h10.5a2.5 2.5 0 1 0-2.5-2.5"/><path d="M3 12.5h15a2.5 2.5 0 1 1-2.5 2.5"/><path d="M3 16.5h7"/>'),
-  shell: icon('<path d="M12 20 4.2 10a8.2 8.2 0 0 1 15.6 0z"/><path d="M12 20 8.2 6.6M12 20V5.4M12 20l3.8-13.4M10 20h4"/>'),
-  feet: icon('<ellipse cx="8.5" cy="15.5" rx="2.4" ry="4"/><ellipse cx="15.5" cy="8.5" rx="2.4" ry="4"/><path d="M7 10.2h.01M10 10.4h.01M14 3.2h.01M17 3.4h.01"/>'),
-  dig: icon('<path d="M15.5 3.5 20.5 8.5"/><path d="M18 6 10.5 13.5"/><path d="M11.8 12.2 6.6 17.4a2.6 2.6 0 0 1-3.7-3.7l5.2-5.2z"/>'),
-  mold: icon('<path d="M5.5 8h13l-1.8 12H7.3z"/><path d="M5.5 8a6.5 4 0 0 1 13 0"/><path d="M9 12.5h6"/>'),
-  pour: icon('<path d="M4.5 3.5h7l-1.2 4.5H5.7z"/><path d="M8.5 8v5.5M8.5 15.5v.5"/><path d="M3 20.5 8.5 17l5.5 3.5z"/>'),
-  drip: icon('<path d="M12 21c-3 0-4.2-1.4-4.2-2.8 0-1.6 1.6-2.6 4.2-2.6s4.2 1 4.2 2.6c0 1.4-1.2 2.8-4.2 2.8z"/><path d="M12 15.6c-1.9 0-2.8-.9-2.8-1.9 0-1.2 1.1-2 2.8-2s2.8.8 2.8 2c0 1-.9 1.9-2.8 1.9z"/><path d="M12 11.7c-1.2 0-1.8-.7-1.8-1.4 0-.9.7-1.6 1.8-1.6s1.8.7 1.8 1.6c0 .7-.6 1.4-1.8 1.4z"/><path d="M12 8.7V4"/>'),
-  water: icon('<path d="M12 3.5c3 4 5.5 7 5.5 10a5.5 5.5 0 0 1-11 0c0-3 2.5-6 5.5-10z"/><path d="M9.5 14.5a2.5 2.5 0 0 0 2.5 2.5"/>'),
-}
-const shortcut = (tool: Tool) => TOOL_KEYS[tool].toUpperCase()
+const closeButton = `<button class="panel-close" type="button" data-close-panel aria-label="Close panel">${icon('<path d="m6 6 12 12M18 6 6 18"/>')}</button>`
+const panelHeading = (id: string, title: string, eyebrow: string) => `<div class="panel-heading"><div><p class="eyebrow">${eyebrow}</p><h2 id="${id}">${title}</h2></div>${closeButton}</div>`
 
-export function createInterface(root: HTMLDivElement) {
+function createElements(root: HTMLDivElement) {
   root.innerHTML = `
-    <canvas class="surface" aria-label="Interactive sand bed. Drag to draw. Keys 1 to 0, minus and equals pick finger, rake, broom, smoother, wind, shell, feet, dig, bucket, pour, drip or water; K picks the knife. T changes the sand, M changes symmetry, L changes the time of day, G starts a zen garden, W writes a message. Arrow keys move a virtual tool; hold Space to draw. Brackets change tool size. Control Z undoes, S saves an image, R resets." tabindex="0"></canvas>
-    <header class="masthead">
-      <h1 class="brand" aria-label="Tidewrit">
-        <span aria-hidden="true">t</span><span aria-hidden="true">i</span><span aria-hidden="true">d</span><span aria-hidden="true">e</span><span aria-hidden="true">w</span><span aria-hidden="true">r</span><span aria-hidden="true">i</span><span aria-hidden="true">t</span>
-      </h1>
-    </header>
-    <nav class="actions" aria-label="History and export">
+    <canvas class="surface" aria-label="Interactive sand bed" aria-describedby="canvas-instructions" tabindex="0"></canvas>
+    <p id="canvas-instructions" class="sr-only">Drag to draw in the sand. Use the tools menu to choose a tool. With the canvas focused, arrow keys move the tool and holding Space draws. Brackets change size. Control or Command Z undoes. R resets. Press ? for all shortcuts.</p>
+    <header class="masthead"><h1 class="brand" aria-label="Tidewrit">${[...'tidewrit'].map((letter) => `<span aria-hidden="true">${letter}</span>`).join('')}</h1><p class="tagline">A little room to play.</p></header>
+    <nav class="actions" aria-label="History, export and sound">
       <button id="undo" type="button" title="Undo (Ctrl/⌘ Z)" aria-label="Undo" disabled>${icon('<path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>')}</button>
       <button id="redo" type="button" title="Redo (Ctrl/⌘ Shift Z)" aria-label="Redo" disabled>${icon('<path d="m15 14 5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/>')}</button>
       <button id="save" type="button" title="Save image (S)" aria-label="Save image">${icon('<path d="M12 4v11"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/>')}</button>
+      <button id="sound" type="button" title="Mute sound (U)" aria-label="Mute sound" aria-pressed="false">${icon('<path d="m11 4-6 5H2v6h3l6 5z"/><path class="sound-waves" d="M15 8a6 6 0 0 1 0 8M18 5a10 10 0 0 1 0 14"/><path class="sound-off" d="m16 9 6 6m0-6-6 6"/>')}</button>
     </nav>
-    <nav class="toolbar" aria-label="Sand tools">
-      <div class="tools" role="radiogroup" aria-label="Tool">${TOOLS.map((tool, index) => `<button type="button" role="radio" data-tool="${tool}" aria-checked="${index === 0}" aria-label="${toolLabels[tool]}" title="${toolTitles[tool]} (${shortcut(tool)})">${toolIcons[tool]}<span>${toolLabels[tool]}</span></button>`).join('')}</div>
-      <span class="divider" aria-hidden="true"></span>
-      <label>Size <input id="radius" type="range" min="6" max="22" step="1" value="12" aria-label="Tool size" /></label>
-      <span class="divider" aria-hidden="true"></span>
-      <div class="modes">
-        <button id="symmetry" type="button" title="Drawing symmetry (M)" aria-label="Symmetry: ${SYMMETRIES[0].label}">Symmetry <b>${SYMMETRIES[0].label}</b></button>
-        <button id="material" type="button" title="Sand (T)" aria-expanded="false" aria-controls="materials" aria-label="Sand: ${MATERIALS[0].label}">Sand <b>${MATERIALS[0].label}</b></button>
-        <button id="light" type="button" title="Time of day (L)" aria-label="Time of day: ${DAYLIGHTS[0].label}"><b>${DAYLIGHTS[0].label}</b></button>
-        <button id="zen" type="button" title="Let a rake draw a zen garden (G)" aria-pressed="false">Zen garden</button>
-        <button id="write" type="button" title="Write a message in the sand (W)" aria-expanded="false" aria-controls="writer">Write</button>
+    <div class="dock-area">
+      <p id="tool-hint" class="tool-hint">${toolTitles.finger}</p>
+      <nav class="toolbar" aria-label="Sand controls">
+        <button id="tool-picker" class="tool-picker" type="button" aria-expanded="false" aria-controls="tool-panel"><span id="tool-icon">${toolIcons.finger}</span><span id="tool-name">Finger</span>${icon('<path d="m8 10 4 4 4-4"/>')}</button>
+        <label class="size-control"><span>Size <output id="size-value" for="radius">12</output></span><input id="radius" type="range" min="6" max="22" step="1" value="12" aria-label="Tool size" /></label>
+        <button id="scene-picker" class="scene-picker" type="button" aria-expanded="false" aria-controls="scene-panel">${icon('<circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.4 1.4m11.2 11.2L19 19M5 19l1.4-1.4M17.6 6.4 19 5"/>')}<span>Scene</span></button>
+        <button id="create-picker" class="create-picker" type="button" aria-expanded="false" aria-controls="create-panel">${icon('<path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5z"/>')}<span>Create</span></button>
+        <button id="reset" class="reset" type="button" title="Wash the sand clean (R)" aria-label="Start again">${icon('<path d="M3 11a9 9 0 1 1 2.6 7M3 4v7h7"/>')}</button>
+      </nav>
+    </div>
+    <section id="tool-panel" class="panel tool-panel" aria-labelledby="tool-panel-title" hidden>
+      ${panelHeading('tool-panel-title', 'Make your mark.', 'Your tools')}
+      <div class="tools" role="radiogroup" aria-label="Tool">${TOOLS.map((tool, index) => `<button type="button" role="radio" data-tool="${tool}" aria-checked="${index === 0}" tabindex="${index === 0 ? 0 : -1}" aria-label="${toolLabels[tool]}" title="${toolTitles[tool]} (${shortcut(tool)})">${toolIcons[tool]}<span>${toolLabels[tool]}</span><kbd>${shortcut(tool)}</kbd></button>`).join('')}</div>
+      <p class="panel-note">Slow for detail. A quick stroke sends grains flying.</p>
+    </section>
+    <section id="scene-panel" class="panel" aria-labelledby="scene-panel-title" hidden>
+      ${panelHeading('scene-panel-title', 'Set the mood.', 'Your patch of sand')}
+      <div class="scene-settings">
+        <button id="material" type="button" title="Sand (T)" aria-expanded="false" aria-controls="materials" aria-label="Sand: ${MATERIALS[0].label}"><span>Sand</span><b>${MATERIALS[0].label}</b></button>
+        <button id="light" type="button" title="Time of day (L)" aria-label="Time of day: ${DAYLIGHTS[0].label}"><span>Time of day</span><b>${DAYLIGHTS[0].label}</b></button>
+        <button id="symmetry" type="button" title="Drawing symmetry (M)" aria-label="Symmetry: ${SYMMETRIES[0].label}"><span>Symmetry</span><b>${SYMMETRIES[0].label}</b></button>
       </div>
-      <span class="divider" aria-hidden="true"></span>
-      <button id="reset" type="button" title="Return to untouched sand (R)">Start again</button>
-    </nav>
-    <div id="materials" class="options" role="radiogroup" aria-label="Sand" hidden>${MATERIALS.map((material, index) => `<button type="button" role="radio" data-material="${material.id}" aria-checked="${index === 0}">${material.kinetic ? `<i style="background: rgb(${material.color.map((channel) => Math.round(channel * 255)).join(' ')})"></i>` : ''}${material.label}</button>`).join('')}</div>
-    <div id="molds" class="options" role="radiogroup" aria-label="Bucket mold" hidden>${MOLDS.map((mold, index) => `<button type="button" role="radio" data-mold="${mold.id}" aria-checked="${index === 0}">${mold.label}</button>`).join('')}</div>
-    <form id="writer" class="writer" hidden autocomplete="off">
-      <input id="message" type="text" maxlength="48" placeholder="A message for the sand" aria-label="Message to write in the sand" enterkeyhint="go" />
-      <button type="submit">Write it</button>
+      <p class="panel-note">Try night for a little bioluminescence.</p>
+    </section>
+    <section id="create-panel" class="panel" aria-labelledby="create-panel-title" hidden>
+      ${panelHeading('create-panel-title', 'Follow a little curiosity.', 'Something to try')}
+      <div class="create-options">
+        <button id="zen" type="button" title="Let a rake draw a zen garden (G)" aria-pressed="false">${toolIcons.rake}<span><b>Zen garden</b><small>Let the rake wander. Tap again to stop.</small></span></button>
+        <button id="write" type="button" title="Write a message in the sand (W)" aria-expanded="false" aria-controls="writer">${icon('<path d="m4 16 12-12 4 4L8 20H4zM13 7l4 4"/>')}<span><b>A message in the sand</b><small>A few words, drawn one stroke at a time.</small></span></button>
+        <button id="help" type="button" aria-expanded="false" aria-controls="help-panel">${icon('<circle cx="12" cy="12" r="9"/><path d="M9.5 8.5a2.5 2.5 0 0 1 5 0c0 2-2.5 2-2.5 4M12 16h.01"/>')}<span><b>A few pointers</b><small>Gestures, tools and keyboard shortcuts.</small></span></button>
+      </div>
+    </section>
+    <section id="materials" class="panel" aria-labelledby="materials-title" hidden>
+      ${panelHeading('materials-title', 'Find your texture.', 'Sand')}
+      <div class="material-options" role="radiogroup" aria-label="Sand">${MATERIALS.map((material, index) => `<button type="button" role="radio" data-material="${material.id}" aria-checked="${index === 0}" tabindex="${index === 0 ? 0 : -1}"><i style="background: rgb(${material.color.map((channel) => Math.round(channel * 255)).join(' ')})"></i>${material.label}</button>`).join('')}</div>
+      <p class="panel-note">Kinetic sand holds sharper edges. Try it with the knife.</p>
+    </section>
+    <section id="molds" class="panel" aria-labelledby="molds-title" hidden>
+      ${panelHeading('molds-title', 'Turn out something new.', 'Bucket shapes')}
+      <div class="mold-options" role="radiogroup" aria-label="Bucket mold">${MOLDS.map((mold, index) => `<button type="button" role="radio" data-mold="${mold.id}" aria-checked="${index === 0}" tabindex="${index === 0 ? 0 : -1}">${mold.label}</button>`).join('')}</div>
+      <p class="panel-note">Pick a shape, then tap the sand to place it.</p>
+    </section>
+    <form id="writer" class="panel writer" aria-labelledby="writer-title" hidden autocomplete="off">
+      ${panelHeading('writer-title', 'Leave a little message.', 'Written by the sand')}
+      <label class="sr-only" for="message">Message to write in the sand</label>
+      <div class="writer-field"><input id="message" type="text" maxlength="48" placeholder="Wish you were here <3" enterkeyhint="go" /><button type="submit">Write it</button></div>
+      <p class="panel-note">Letters, numbers and &lt;3 for a heart. Up to 48 characters.</p>
     </form>
-    <section class="overlay" aria-live="polite">
-      <div class="boot-panel"><h2>One quiet moment.</h2><p class="status">Preparing the sand bed…</p><div class="boot-line"></div><pre class="diagnostics" hidden></pre><button id="reload" hidden>Try again</button></div>
-    </section>`
+    <section id="help-panel" class="panel help-panel" aria-labelledby="help-title" hidden>
+      ${panelHeading('help-title', 'There’s no wrong way to play.', 'A few pointers')}
+      <p class="help-intro">Drag a finger through the sand. Hold to pour or dig, tap to stamp a shell or bucket, and flick water to throw it. On a touch screen, try a few fingers at once.</p>
+      <dl class="shortcuts"><div><dt>Move the tool</dt><dd>Arrow keys</dd></div><div><dt>Draw with the keyboard</dt><dd>Hold <kbd>Space</kbd></dd></div><div><dt>Tool size</dt><dd><kbd>[</kbd> <kbd>]</kbd></dd></div><div><dt>Undo / redo</dt><dd><kbd>Ctrl/⌘ Z</kbd> / <kbd>⇧ Z</kbd></dd></div><div><dt>Sand / light / symmetry</dt><dd><kbd>T</kbd> <kbd>L</kbd> <kbd>M</kbd></dd></div><div><dt>Zen garden / write</dt><dd><kbd>G</kbd> <kbd>W</kbd></dd></div><div><dt>Save / sound / reset</dt><dd><kbd>S</kbd> <kbd>U</kbd> <kbd>R</kbd></dd></div></dl>
+      <p class="panel-note">Click the sand before using arrow keys. Tool shortcuts appear in the tools menu. Every gesture, even a wash, can be undone.</p>
+    </section>
+    <p id="feedback" class="feedback" role="status" aria-live="polite" aria-atomic="true" hidden></p>
+    <section class="overlay" aria-live="polite"><div class="boot-panel"><h2>One quiet moment.</h2><p class="status">Preparing the sand bed…</p><div class="boot-line"></div><pre class="diagnostics" hidden></pre><button id="reload" type="button" hidden>Try again</button></div></section>`
   const element = <ElementType extends HTMLElement>(selector: string) => root.querySelector<ElementType>(selector)!
   element<HTMLButtonElement>('#reload').onclick = () => window.location.reload()
   return {
-    canvas: element<HTMLCanvasElement>('canvas'), overlay: element<HTMLElement>('.overlay'),
+    root, canvas: element<HTMLCanvasElement>('canvas'), overlay: element<HTMLElement>('.overlay'),
     title: element<HTMLElement>('.boot-panel h2'), status: element<HTMLElement>('.status'),
     diagnostics: element<HTMLElement>('.diagnostics'), reload: element<HTMLButtonElement>('#reload'),
     radius: element<HTMLInputElement>('#radius'), reset: element<HTMLButtonElement>('#reset'),
@@ -90,5 +89,16 @@ export function createInterface(root: HTMLDivElement) {
     molds: element<HTMLElement>('#molds'), moldButtons: [...root.querySelectorAll<HTMLButtonElement>('[data-mold]')],
     material: element<HTMLButtonElement>('#material'), materials: element<HTMLElement>('#materials'), materialButtons: [...root.querySelectorAll<HTMLButtonElement>('[data-material]')],
     undo: element<HTMLButtonElement>('#undo'), redo: element<HTMLButtonElement>('#redo'), save: element<HTMLButtonElement>('#save'),
+    sound: element<HTMLButtonElement>('#sound'), help: element<HTMLButtonElement>('#help'),
+    toolbar: element<HTMLElement>('.toolbar'), toolPicker: element<HTMLButtonElement>('#tool-picker'),
+    scenePicker: element<HTMLButtonElement>('#scene-picker'), createPicker: element<HTMLButtonElement>('#create-picker'),
+    toolPanel: element<HTMLElement>('#tool-panel'), scenePanel: element<HTMLElement>('#scene-panel'), createPanel: element<HTMLElement>('#create-panel'), helpPanel: element<HTMLElement>('#help-panel'),
+    toolIcon: element<HTMLElement>('#tool-icon'), toolName: element<HTMLElement>('#tool-name'), toolHint: element<HTMLElement>('#tool-hint'),
+    sizeValue: element<HTMLOutputElement>('#size-value'), feedback: element<HTMLElement>('#feedback'),
   }
+}
+
+export function createInterface(root: HTMLDivElement) {
+  const nodes = createElements(root)
+  return { ...nodes, controls: new InterfaceControls(nodes) }
 }

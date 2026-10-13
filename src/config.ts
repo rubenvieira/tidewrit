@@ -153,7 +153,7 @@ export const MATERIALS: readonly SandMaterial[] = [
 // A landed deposit: `amount` moisture over a soft disk of `radius`, an impact
 // pit of depth `pit`, and `sand` metres of new sand at the center of a
 // Gaussian with standard deviation radius / 2 (volume sand · π · radius² / 4).
-export type Deposit = { x: number; y: number; radius: number; amount: number; pit: number; pitRadius: number; sand: number }
+export type Deposit = { x: number; y: number; radius: number; amount: number; pit: number; pitRadius: number; sand: number; from?: Point }
 export const POUR = {
   // Sand volume per second at the default size; scales with size squared.
   rate: 1e-5,

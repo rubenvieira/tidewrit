@@ -46,11 +46,11 @@ export class ImageExport {
 /** Shares the image where the platform offers a share sheet with files, otherwise downloads it. */
 export async function deliverImage(blob: Blob) {
   const stamp = new Date().toISOString().slice(0, 19).replace(/[-:]/g, '').replace('T', '-')
-  const file = new File([blob], `sand-${stamp}.png`, { type: 'image/png' })
+  const file = new File([blob], `tidewrit-${stamp}.png`, { type: 'image/png' })
   const coarse = window.matchMedia('(pointer: coarse)').matches
   if (coarse && navigator.canShare?.({ files: [file] })) {
-    try { await navigator.share({ files: [file] }); return } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') return
+    try { await navigator.share({ files: [file] }); return 'shared' as const } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled' as const
     }
   }
   const url = URL.createObjectURL(file)
@@ -59,4 +59,5 @@ export async function deliverImage(blob: Blob) {
   link.click()
   link.remove()
   setTimeout(() => URL.revokeObjectURL(url), 10_000)
+  return 'downloaded' as const
 }

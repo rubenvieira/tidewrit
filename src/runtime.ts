@@ -21,6 +21,7 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
   const history = new SandHistory(gpu.device, solver)
   const imageExport = new ImageExport(gpu.device, gpu.format)
   const sound = new SandSound()
+  ui.controls.connectSound(sound)
   const soundReady = sound.prepare()
   const clock = new FixedClock(SAND.step, SAND.maxSteps)
   const listeners = new AbortController()
@@ -40,13 +41,11 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
   const syncHistoryButtons = () => {
     ui.undo.disabled = !toolbarInteractive || !history.canUndo
     ui.redo.disabled = !toolbarInteractive || !history.canRedo
+    ui.save.disabled = !toolbarInteractive || saving
   }
   const setToolbarInteractive = (interactive: boolean) => {
     toolbarInteractive = interactive
-    ui.reset.disabled = !interactive
-    ui.radius.disabled = !interactive
-    for (const button of [...ui.tools, ui.symmetry, ui.zen, ui.write, ui.material, ui.light]) button.disabled = !interactive
-    if (!interactive) { ui.writer.hidden = true; ui.write.setAttribute('aria-expanded', 'false') }
+    ui.controls.setInteractive(interactive)
     input?.setInteractive(interactive)
     syncHistoryButtons()
   }
@@ -57,6 +56,7 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
     cancelAnimationFrame(animation)
     listeners.abort()
     input?.dispose()
+    ui.controls.dispose()
     sound.dispose()
     history.dispose(); renderer.dispose(); solver.dispose(); gpu.dispose()
   }
@@ -100,6 +100,7 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
         resize()
         const encoder = gpu.device.createCommandEncoder()
         const activeInput = input!
+        solver.setKinetic(activeInput.material.kinetic)
         let exportImage = false
         if (!waveResetInteractive) {
           for (const action of activeInput.takeActions()) {
@@ -159,7 +160,6 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
         if (count > 0) solver.encode(encoder, Array.from({ length: count }, () => activeInput.strokes.nextBatch()))
         renderer.setDaylight(activeInput.daylight.sample(now))
         renderer.setMaterial(activeInput.material)
-        solver.setKinetic(activeInput.material.kinetic)
         const preview = activeInput.preview()
         renderer.encode(encoder, gpu.context.getCurrentTexture().createView(), preview.cursor, now, preview.visible, waveState, preview.tool)
         const finishExport = exportImage
@@ -169,9 +169,16 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
         if (finishExport) {
           saving = true
           ui.save.disabled = true
-          void finishExport().then(deliverImage).catch((error: unknown) => console.error('[Tidewrit] Image export failed', error)).finally(() => {
+          ui.controls.announce('Preparing your image…')
+          void finishExport().then(deliverImage).then((result) => {
+            if (stopped) return
+            ui.controls.announce(result === 'shared' ? 'Image shared.' : result === 'cancelled' ? 'Sharing cancelled.' : 'Image ready. Check your downloads.')
+          }).catch((error: unknown) => {
+            console.error('[Tidewrit] Image export failed', error)
+            if (!stopped) ui.controls.announce('The image could not be saved. Please try again.')
+          }).finally(() => {
             saving = false
-            ui.save.disabled = false
+            syncHistoryButtons()
           })
         }
         framesInFlight++

@@ -2,6 +2,9 @@ import { KINETIC, POUR, SAND, WATER } from '../config'
 import { fluxLayout } from './flux'
 import { toolFootprints } from './footprints'
 import { bedReliefWgsl } from './bed-relief'
+import { PARTICLE_CONTACT, particleContactWgsl } from './particle-contact'
+import { particleDepositionWgsl } from './particle-deposition'
+import { GRANULAR_MOTION, granularMotionWgsl } from './granular-motion'
 
 // Cohesion is a height, not a steeper angle: a cohesive material stands as a
 // vertical face up to a critical height set by its strength, as a damp
@@ -125,6 +128,7 @@ fn impactResponse(speed: f32) -> f32 {
   return smoothstep(${SAND.impactSpeedStart}, ${SAND.impactSpeedFull}, speed);
 }
 ${moistureResponse}
+${granularMotionWgsl}
 fn impactCore(contact: vec4f, pressure: f32) -> f32 {
   return impactResponse(length(contact.zw)) * pressure * pow(contact.x, 1.75);
 }
@@ -165,6 +169,10 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
   let centerMoisture = moisture[address(cell)];
   let centerPacking = packing[address(cell)];
   let kinetic = params.material.x > 0.5;
+  let runoutVelocity = stoppedVelocity(center.zw);
+  let mobileLayer = min(${GRANULAR_MOTION.layer}, center.y * params.grid.w)
+    * dryMobility(centerMoisture, kinetic) * (1.0 - toolContact.x);
+  let running = mobileLayer > 0.0 && dot(runoutVelocity, runoutVelocity) > 0.0;
   var outgoing = Flux(vec4f(0.0), vec4f(0.0));
   var escape = Flux(vec4f(0.0), vec4f(0.0));
   var coverageGradient = vec2f(0.0);
@@ -209,6 +217,11 @@ fn transport(@builtin(global_invocation_id) invocation: vec3u) {
     let avalancheBoost = 1.0 + supercritical * mix(0.35, 0.85, max(contactYield, disturbedShell));
     var amount = excess * params.grid.w * params.tool.z * weight * avalancheBoost;
     amount *= 1.0 + toolContact.x * speedResponse * forward * 0.55 + impact * forward * 0.95;
+    // Released dry grains retain a little runout. This shares the conservative
+    // eight-link limiter with slope flow and never mobilizes a resting bed.
+    if (running) {
+      amount += mobileLayer * runoutFraction(runoutVelocity, axisDirection, other.x - center.x, linkLength) * weight;
+    }
     if (kinetic) {
       // Slow viscous creep of everything steeper than dry sand's repose.
       let creepExcess = max(0.0, center.x - other.x - params.physics.z * params.grid.y * linkLength);
@@ -273,8 +286,15 @@ fn integrate(@builtin(global_invocation_id) invocation: vec3u) {
   let transportVelocity = (fluxVector(outgoing) - fluxVector(incoming)) * params.grid.y / max(height * params.grid.w, 1e-7);
   let slipCoupling = 0.38 / (1.0 + toolSpeed * 0.30);
   let toolVelocity = toolContact.zw * toolContact.x * toolPressure * slipCoupling;
-  let velocity = transportVelocity + toolVelocity;
-  destination[index] = vec4f(height, activity, mix(current.zw, velocity, 0.4));
+  var velocity = mix(current.zw, transportVelocity + toolVelocity, 0.4);
+  if (params.material.x < 0.5 && moisture[index] < 0.08 && toolContact.x * toolPressure < 0.001) {
+    let retained = stoppedVelocity(current.zw);
+    let arriving = stoppedVelocity(transportVelocity);
+    // Do not add flux-derived speed back onto the retained momentum: the
+    // same moving sand would then feed its own velocity indefinitely.
+    velocity = select(arriving, retained, dot(retained, retained) > dot(arriving, arriving));
+  }
+  destination[index] = vec4f(height, activity, velocity);
 }
 `;
 
@@ -338,6 +358,8 @@ fn contactAt(position: vec2f) -> vec3f {
   let gradient = vec2f(upperRight - upperLeft, upperRight - lowerRight);
   return vec3f(upperRight + dot(gradient, blend - 1.0), gradient / params.grid.y);
 }
+${particleContactWgsl}
+${particleDepositionWgsl}
 @compute @workgroup_size(64)
 fn animate(@builtin(global_invocation_id) invocation: vec3u) {
   let index = invocation.x;
@@ -354,28 +376,44 @@ fn animate(@builtin(global_invocation_id) invocation: vec3u) {
       grain.velocity = vec4f(grain.velocity.xyz * drag, grain.velocity.w);
     }
     grain.velocity.y -= 9.81 * params.grid.w;
-    grain.position = vec4f(grain.position.xyz + grain.velocity.xyz * params.grid.w, grain.position.w);
+    // Limit only pathological horizontal flights to the exact triangle walk's
+    // budget. No ray can skip untested cells, even after extreme input speeds.
+    let travelCells = (abs(grain.velocity.x) + abs(grain.velocity.z)) * params.grid.w / params.grid.y;
+    let travelScale = min(1.0, ${PARTICLE_CONTACT.maxCells - 3}.0 / max(travelCells, 1e-8));
+    grain.velocity.x *= travelScale;
+    grain.velocity.z *= travelScale;
+    let previous = grain.position.xyz;
+    grain.position = vec4f(previous + grain.velocity.xyz * params.grid.w, grain.position.w);
     age += params.grid.w;
     grain.velocity.w = select(age, -age, impactGrain);
     let limit = params.grid.z * 0.5 - params.grid.y;
     grain.position.x = clamp(grain.position.x, -limit, limit);
     grain.position.z = clamp(grain.position.z, -limit, limit);
-    let cell = address(grain.position.xz);
-    let surface = contactAt(grain.position.xz);
-    if (grain.position.y <= surface.x + 0.00014) {
+    let collision = sweptBedImpact(previous, grain.position.xyz);
+    if (collision.fraction <= 1.0) {
+      grain.position = vec4f(mix(previous, grain.position.xyz, collision.fraction), grain.position.w);
+      let cell = address(grain.position.xz);
+      let surface = collision.surface;
       let normal = normalize(vec3f(-surface.y, 1.0, -surface.z));
       let normalSpeed = dot(grain.velocity.xyz, normal);
+      let adhesion = smoothstep(0.08, 0.6, moisture[cell]);
       if (normalSpeed < -0.08 && age < 0.22) {
-        grain.position.y = surface.x + 0.00018;
+        grain.position.y = surface.x + ${PARTICLE_CONTACT.restingClearance};
         let tangent = grain.velocity.xyz - normal * normalSpeed;
-        let friction = max(0.0, 1.0 - params.physics.w * 1.22 * abs(normalSpeed) / max(length(tangent), 1e-7));
-        grain.velocity = vec4f(tangent * friction - normal * normalSpeed * 0.22, grain.velocity.w);
+        let friction = max(0.0, 1.0 - params.physics.w * mix(1.22, 2.4, adhesion) * abs(normalSpeed) / max(length(tangent), 1e-7));
+        let restitution = mix(0.22, 0.035, adhesion);
+        grain.velocity = vec4f(tangent * friction - normal * normalSpeed * restitution, grain.velocity.w);
       } else {
-        atomicAdd(&ledger[cell], i32(round(grain.position.w * 1e9)));
+        depositGrain(grain.position.xz, grain.position.w);
         grain.position.w = 0.0;
         grain.velocity.w = 0.0;
       }
     }
+    // The tray absorbs motion into its boundary while retaining the flight's
+    // vertical and along-edge components. Clamping position alone left grains
+    // pinned to an edge with outward kinetic energy on every following step.
+    if (abs(grain.position.x) >= limit && grain.position.x * grain.velocity.x > 0.0) { grain.velocity.x = 0.0; }
+    if (abs(grain.position.z) >= limit && grain.position.z * grain.velocity.z > 0.0) { grain.velocity.z = 0.0; }
   } else {
     grain.velocity.w += 1.0;
     let seed = index * 991u + u32(grain.velocity.w);

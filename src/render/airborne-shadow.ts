@@ -37,9 +37,14 @@ struct ShadowVertexOutput {
   let sunPenumbra = height * 0.00471;
   let physicalFootprint = physicalRadius + sunPenumbra;
   let texel = params.bed.y / params.bed.z;
+  let baseRadius = max(physicalRadius, texel * 0.90);
   let opticalRadius = max(physicalFootprint, texel * 0.90);
-  let areaRatio = physicalFootprint * physicalFootprint / max(opticalRadius * opticalRadius, 1e-12);
-  let density = min(0.26, areaRatio * 7.0);
+  // A higher grain spreads the same blocked sunlight across its penumbra;
+  // the sun's angular size must not increase the grain's occluding area.
+  // Freeze the existing ground-level softness cap into that area budget too,
+  // so larger parcels cannot regain capped energy when their penumbra grows.
+  let occludingArea = min(physicalRadius * physicalRadius * 7.0, 0.26 * baseRadius * baseRadius);
+  let density = occludingArea / max(opticalRadius * opticalRadius, 1e-12);
   let offset = corners[vertex] * opticalRadius;
   let world = shadowCenter + offset;
 

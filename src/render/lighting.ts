@@ -1,11 +1,13 @@
 import { checkedShader } from '../platform/shader'
 import type { SandSolver } from '../simulation/solver'
+import { horizonOcclusionWgsl } from './horizon-occlusion'
 
 export const lightingShader = `
 struct View { eye: vec4f, forward: vec4f, right: vec4f, up: vec4f, light: vec4f, grid: vec4f, pointer: vec4f }
 @group(0) @binding(0) var<uniform> view: View;
 @group(0) @binding(1) var<storage, read> bed: array<vec4f>;
 @group(0) @binding(2) var<storage, read_write> lighting: array<vec4f>;
+${horizonOcclusionWgsl}
 fn heightAt(cell: vec2i) -> f32 {
   let bounded = vec2u(clamp(cell, vec2i(0), vec2i(i32(view.grid.x) - 1)));
   return bed[bounded.y * u32(view.grid.x) + bounded.x].x;
@@ -41,17 +43,16 @@ fn illuminate(@builtin(global_invocation_id) invocation: vec3u) {
   var obscured = 0.0;
   for (var axis = 0u; axis < 8u; axis++) {
     let direction = directions[axis];
-    let tangentAngle = atan(dot(gradient, direction));
-    var horizon = 0.0;
+    let tangentSlope = dot(gradient, direction);
+    var highestSlope = tangentSlope;
     for (var sampleIndex = 0u; sampleIndex < 6u; sampleIndex++) {
       let distance = radii[sampleIndex] * spacing;
       let probe = coordinate + direction * radii[sampleIndex];
       if (any(probe < vec2f(0.0)) || any(probe > vec2f(view.grid.x - 1.0))) { break; }
-      let angle = atan((sampleHeight(probe) - height - 0.00008) / distance);
-      horizon = max(horizon, angle - tangentAngle);
+      let slope = (sampleHeight(probe) - height - 0.00008) / distance;
+      highestSlope = max(highestSlope, slope);
     }
-    let blocked = sin(min(horizon, 1.57079633));
-    obscured += blocked * blocked;
+    obscured += horizonOcclusionSquared(tangentSlope, highestSlope);
   }
   lighting[invocation.y * u32(view.grid.x) + invocation.x] = vec4f(visibility, clamp(1.0 - obscured / 8.0, 0.0, 1.0), 0.0, 0.0);
 }
