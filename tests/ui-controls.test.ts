@@ -80,13 +80,13 @@ function fixture() {
     root: element(), toolbar: element(), canvas: element(),
     toolPicker: element(), scenePicker: element(), createPicker: element(),
     toolPanel: element(), scenePanel: element(), createPanel: element(),
-    materials: element(), molds: element(), writer: element(), helpPanel: element(),
+    materials: element(), molds: element(), writer: element(),
     material: element(), write: element(), help: element(), light: element(), symmetry: element(), zen: element(), reset: element(), sound: element(),
     toolIcon: element(), toolName: element(), toolHint: element(), sizeValue: element(), feedback: element(),
     radius: Object.assign(new Input(), { value: '12', type: 'range' }), message: new Input(),
     tools: [element(), element(), element()], materialButtons: [element(), element()], moldButtons: [element(), element()],
   }
-  const panels: Record<Panel, Element> = { tools: ui.toolPanel, scene: ui.scenePanel, create: ui.createPanel, materials: ui.materials, molds: ui.molds, writer: ui.writer, help: ui.helpPanel }
+  const panels: Record<Panel, Element> = { tools: ui.toolPanel, scene: ui.scenePanel, create: ui.createPanel, materials: ui.materials, molds: ui.molds, writer: ui.writer }
   ui.root.append(ui.toolbar, ui.canvas, ...Object.values(panels))
   ui.toolbar.append(ui.toolPicker, ui.scenePicker, ui.createPicker, ui.radius, ui.reset)
   ui.scenePanel.append(ui.material, ui.light, ui.symmetry)
@@ -131,7 +131,7 @@ describe('Transient interface panels', () => {
     expect(ui.root.classList.contains('panel-open')).toBe(false)
   })
 
-  test.each<Panel>(['materials', 'writer', 'help'])('Escape from %s returns focus to a visible dock trigger', (panel) => {
+  test.each<Panel>(['materials', 'writer'])('Escape from %s returns focus to a visible dock trigger', (panel) => {
     const { ui, controls, documentTarget, panels } = fixture()
     controls.openPanel(panel === 'materials' ? 'scene' : 'create')
     controls.openPanel(panel)
@@ -142,18 +142,25 @@ describe('Transient interface panels', () => {
     expect(Element.focused?.closest('[hidden]')).toBeNull()
   })
 
-  test('opening tools focuses the checked radio and opening help focuses its panel', () => {
+  test('opening tools focuses the checked radio and opening the writer selects its field', () => {
     const { ui, controls } = fixture()
     ui.tools[0].setAttribute('aria-checked', 'false')
     ui.tools[2].setAttribute('aria-checked', 'true')
     controls.openPanel('tools')
     expect(Element.focused).toBe(ui.tools[2])
-    controls.openPanel('help')
-    expect(Element.focused).toBe(ui.helpPanel)
-    expect(ui.helpPanel.tabIndex).toBe(-1)
     controls.openPanel('writer')
     expect(Element.focused).toBe(ui.message)
     expect(ui.message.select).toHaveBeenCalledOnce()
+  })
+
+  test('the pointers button closes the panel and opens the About dialog', () => {
+    const { ui, controls } = fixture()
+    const showModal = vi.fn()
+    Object.assign(document, { querySelector: (selector: string) => selector === '#about' ? { showModal } : null })
+    controls.openPanel('create')
+    ui.help.click()
+    expect(ui.createPanel.hidden).toBe(true)
+    expect(showModal).toHaveBeenCalledOnce()
   })
 
   test('locking closes every panel, disables editing controls, and rejects reopening', () => {
@@ -215,7 +222,6 @@ describe('Transient interface panels', () => {
     dispatch(viewport, 'resize')
     dispatch(viewport, 'scroll')
     expect(ui.toolPanel.hidden).toBe(true)
-    expect(ui.helpPanel.hidden).toBe(true)
     expect(ui.toolbar.getBoundingClientRect).not.toHaveBeenCalled()
   })
 })

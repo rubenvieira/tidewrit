@@ -3,7 +3,7 @@ import type { Tool } from '../config'
 import type { InterfaceNodes } from './interface'
 import { toolIcons, toolLabels, toolTitles } from './tools'
 
-export type Panel = 'tools' | 'scene' | 'create' | 'materials' | 'molds' | 'writer' | 'help'
+export type Panel = 'tools' | 'scene' | 'create' | 'materials' | 'molds' | 'writer'
 
 /** Owns the dock and transient panels; never reads layout in the render loop. */
 export class InterfaceControls {
@@ -20,8 +20,8 @@ export class InterfaceControls {
 
   constructor(ui: InterfaceNodes) {
     this.ui = ui
-    this.panels = { tools: ui.toolPanel, scene: ui.scenePanel, create: ui.createPanel, materials: ui.materials, molds: ui.molds, writer: ui.writer, help: ui.helpPanel }
-    this.triggers = { tools: ui.toolPicker, scene: ui.scenePicker, create: ui.createPicker, materials: ui.material, molds: ui.toolPicker, writer: ui.write, help: ui.help }
+    this.panels = { tools: ui.toolPanel, scene: ui.scenePanel, create: ui.createPanel, materials: ui.materials, molds: ui.molds, writer: ui.writer }
+    this.triggers = { tools: ui.toolPicker, scene: ui.scenePicker, create: ui.createPicker, materials: ui.material, molds: ui.toolPicker, writer: ui.write }
     const { signal } = this.controller
     const toggle = (panel: Panel) => {
       if (this.active === panel) this.closePanels()
@@ -30,7 +30,7 @@ export class InterfaceControls {
     ui.toolPicker.addEventListener('click', () => toggle('tools'), { signal })
     ui.scenePicker.addEventListener('click', () => toggle('scene'), { signal })
     ui.createPicker.addEventListener('click', () => toggle('create'), { signal })
-    ui.help.addEventListener('click', () => this.openPanel('help'), { signal })
+    ui.help.addEventListener('click', () => { this.closePanels(); document.querySelector<HTMLDialogElement>('#about')?.showModal() }, { signal })
     for (const button of ui.root.querySelectorAll<HTMLButtonElement>('[data-close-panel]')) {
       button.addEventListener('click', () => this.closePanels(true), { signal })
     }
@@ -45,9 +45,6 @@ export class InterfaceControls {
       if (event.key === 'Escape' && this.active) {
         event.preventDefault()
         this.closePanels(true)
-      } else if (event.key === '?' && !event.ctrlKey && !event.metaKey && !event.altKey && !this.isEditing(event.target)) {
-        event.preventDefault()
-        toggle('help')
       }
     }, { signal })
     // Radio groups have a single tab stop and preserve native slider/field keys.
@@ -153,8 +150,8 @@ export class InterfaceControls {
 
   connectSound(sound: SandSound) {
     const sync = () => {
-      this.ui.sound.setAttribute('aria-pressed', String(sound.muted))
-      this.ui.sound.title = `${sound.muted ? 'Unmute' : 'Mute'} sound (U)`
+      this.ui.sound.setAttribute('aria-pressed', String(!sound.muted))
+      this.ui.sound.title = `${sound.muted ? 'Turn sound on' : 'Turn sound off'} (U)`
     }
     const toggle = () => { sound.setMuted(!sound.muted); sync() }
     const { signal } = this.controller

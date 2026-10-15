@@ -153,6 +153,7 @@ afterEach(() => {
 
 describe('sound controls', () => {
   it('routes ambient, reset, drawing, splash and thud through one master gain', async () => {
+    storage.set('tidewrit.audio.muted', 'false')
     const sound = createSound()
     await sound.prepare()
     sound.playResetWave()
@@ -202,6 +203,7 @@ describe('sound controls', () => {
   })
 
   it('queues resume synchronously even when the previous suspend is pending', async () => {
+    storage.set('tidewrit.audio.muted', 'false')
     const sound = createSound()
     await sound.prepare()
     const context = FakeContext.instances[0]
@@ -220,6 +222,7 @@ describe('sound controls', () => {
   })
 
   it('silences a hidden page, resumes ambience only, and preserves the mute choice', async () => {
+    storage.set('tidewrit.audio.muted', 'false')
     const sound = createSound()
     await sound.prepare()
     sound.playResetWave()
@@ -267,9 +270,13 @@ describe('sound controls', () => {
       setItem: () => { throw new Error('storage unavailable') },
     })
     const sound = createSound()
-    expect(sound.muted).toBe(false)
-    expect(() => sound.setMuted(true)).not.toThrow()
     expect(sound.muted).toBe(true)
+    expect(() => sound.setMuted(false)).not.toThrow()
+    expect(sound.muted).toBe(false)
+  })
+
+  it('starts muted until someone turns sound on', () => {
+    expect(createSound().muted).toBe(true)
   })
 })
 

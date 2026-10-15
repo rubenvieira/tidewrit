@@ -2,9 +2,10 @@ const mutedPreferenceKey = 'tidewrit.audio.muted'
 
 export function readMutedPreference() {
   try {
-    return localStorage.getItem(mutedPreferenceKey) === 'true'
+    // Sound starts off on Play until someone turns it on.
+    return localStorage.getItem(mutedPreferenceKey) !== 'false'
   } catch {
-    return false
+    return true
   }
 }
 
