@@ -1,0 +1,17 @@
+Tidewrit: licence and notices
+=============================
+
+Tidewrit is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License, version 3 only (GPL-3.0-only).
+It comes WITHOUT ANY WARRANTY. Full licence text: LICENSE.txt, next to this
+file. Complete source code: https://github.com/rubenvieira/tidewrit
+
+Tidewrit is a modified version of Sandboard by Scott Sun
+(https://github.com/scottstts/Sandboard, https://sand.scottsun.io),
+also GPL-3.0-only, including its beach and wave sounds.
+Copyright (C) 2026 Scott Sun (Sandboard)
+Copyright (C) 2026 Ruben Vieira (modifications, from 13 October 2026)
+
+DM Sans (interface font), Copyright 2014 The DM Sans Project Authors
+(https://github.com/googlefonts/dm-fonts), SIL Open Font License 1.1.
+See src/play-chrome/DM-Sans-OFL.txt in the source.

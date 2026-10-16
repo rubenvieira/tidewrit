@@ -73,6 +73,7 @@ function createElements(root: HTMLDivElement) {
         ['Create', 'Let a rake draw a zen garden, or have the sand write a message.'],
         ['Keyboard', 'With the sand focused, arrow keys move the tool and holding <kbd>Space</kbd> draws. <kbd>[</kbd> <kbd>]</kbd> change size.'],
         ['Keys', '<kbd>Ctrl/⌘ Z</kbd> undo · <kbd>⇧</kbd> redo · T sand · L light · M symmetry · G zen garden · W write · S save · U sound · R reset · H hides the interface · ? this page.'],
+        ['Credits', 'Tidewrit is a modified version of <a href="https://github.com/scottstts/Sandboard" target="_blank" rel="noreferrer">Sandboard</a> by Scott Sun, whose sand simulation and beach sounds it builds on. Free software under the <a href="LICENSE.txt" target="_blank">GPL-3.0</a>, with no warranty; <a href="https://github.com/rubenvieira/tidewrit" target="_blank" rel="noreferrer">source code</a> · <a href="NOTICE.txt" target="_blank">notices</a>.'],
       ],
       close: 'Back to the sand',
     })}

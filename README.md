@@ -13,7 +13,14 @@ On a phone or tablet, several fingers can join in at once, which makes Tidewrit 
 
 There is no score, no objective, and no correct thing to make. The whole point is the moment between a clean surface and whatever you decide to do to it next.
 
-## License
+## Credits and licence
+
+Tidewrit is a modified version of **Sandboard** by **Scott Sun** ([source](https://github.com/scottstts/Sandboard), [live](https://sand.scottsun.io)). The sand simulation it starts from, and the beach and wave sounds, come from that project.
+
+Copyright (C) 2026 Scott Sun (Sandboard)
+Copyright (C) 2026 Ruben Vieira (modifications)
+
+**Modified by Ruben Vieira, from 13 October 2026:** new tools, water, digging and bucket molds, kinetic sand, time of day, the zen garden and sand writing, rendering work and the shared Play interface. The commit history records every change.
 
 This project is licensed under the GNU General Public License v3.0 (GPL-3.0-only).
 

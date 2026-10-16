@@ -2,6 +2,11 @@
   "name": "tidewrit",
   "private": true,
   "version": "0.0.0",
+  "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rubenvieira/tidewrit"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",

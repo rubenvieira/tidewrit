@@ -92,3 +92,6 @@ kbd { font: inherit; }
 }
 @media (pointer: coarse) { .tools kbd { display: none; } .toolbar button { min-height: 44px; } }
 @media (prefers-reduced-motion: reduce) { *, *::after { animation: none !important; transition: none !important; } }
+
+/* Links in the About dialog (credits and licence) read as text, not browser blue. */
+.pc-about dd a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
