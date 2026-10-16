@@ -26,6 +26,10 @@ export const WAVE_RESET = {
   washGloss: 0.42,
   rippleScale: 24,
   rippleDrift: 0.48,
+  // Seconds for covered sand to lose 63% of its prints, and to smooth across
+  // one cell: the swash slumps ridges into grooves as it erases them.
+  washSettle: 0.42,
+  washSmooth: 0.05,
 } as const
 
 export type WaveResetViewport = {
@@ -41,6 +45,8 @@ export type WaveResetState = {
   justFinished: boolean
   erase: boolean
   time: number
+  /** Seconds since the previous update, for the wash's frame-rate independent erosion. */
+  deltaTime: number
   previousBaseFront: number
   currentBaseFront: number
   progress: number
@@ -131,6 +137,7 @@ export function idleWaveResetState(): WaveResetState {
     justFinished: false,
     erase: false,
     time: 0,
+    deltaTime: 0,
     previousBaseFront: renderExitFront,
     currentBaseFront: renderExitFront,
     progress: 0,
@@ -152,6 +159,7 @@ export class WaveResetEffect {
   private previousRenderFront = renderEntryFront
   private previousEraseFront = eraseOriginFront
   private previousEraseTime = 0
+  private previousTime = 0
   private firstUpdate = true
 
   start(now: number, durationSeconds?: number, viewport: WaveResetViewport = fullBedViewport) {
@@ -166,6 +174,7 @@ export class WaveResetEffect {
     this.previousRenderFront = renderEntryFront
     this.previousEraseFront = eraseOriginFront
     this.previousEraseTime = 0
+    this.previousTime = 0
     this.firstUpdate = true
   }
 
@@ -204,13 +213,15 @@ export class WaveResetEffect {
       justFinished = true
     }
 
+    const time = Math.min(elapsedSeconds, this.durationSeconds)
     const state: WaveResetState = {
       active,
       incoming,
       justStarted: this.firstUpdate,
       justFinished,
       erase,
-      time: Math.min(elapsedSeconds, this.durationSeconds),
+      time,
+      deltaTime: Math.max(0, time - this.previousTime),
       previousBaseFront: previousRenderFront,
       currentBaseFront: currentRenderFront,
       progress,
@@ -221,6 +232,7 @@ export class WaveResetEffect {
     }
 
     this.firstUpdate = false
+    this.previousTime = time
     this.previousRenderFront = currentRenderFront
     if (erase) {
       this.previousEraseFront = eraseCurrentFront

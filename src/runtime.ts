@@ -129,7 +129,7 @@ export async function startTidewrit(ui: InterfaceElements, monitor: BootMonitor)
             solver.clearTransientState(encoder)
             waveResetNeedsTransientClear = false
           }
-          if (waveState.erase) solver.encodeWaveReset(encoder, waveState)
+          if (waveState.active || waveState.justFinished) solver.encodeWaveReset(encoder, waveState)
           if (waveState.justFinished) {
             waveResetInteractive = false
             clock.reset(now)

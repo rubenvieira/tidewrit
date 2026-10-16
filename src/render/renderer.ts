@@ -15,6 +15,9 @@ export type ToolPreview = { kind: number; angle: number; direction: Point; symme
 export const fingerPreview: ToolPreview = { kind: TOOL_KIND.finger, angle: 0, direction: { x: 1, y: 0 }, symmetry: SYMMETRIES[0], variant: 0 }
 
 
+/** Seconds between bed lighting refreshes while the reset wash reshapes the sand. */
+const WASH_LIGHTING_INTERVAL = 0.25
+
 export class SandRenderer {
   readonly camera = new SandCamera()
   private readonly uniform: GPUBuffer
@@ -34,6 +37,7 @@ export class SandRenderer {
   private readonly data = new Float32Array(60)
   private material: SandMaterial = MATERIALS[0]
   private daylight: Daylight = new DaylightCycle().sample(0)
+  private washLitAt = Number.NEGATIVE_INFINITY
 
   private readonly device: GPUDevice
   private readonly solver: SandSolver
@@ -142,7 +146,13 @@ export class SandRenderer {
     ])
     this.device.queue.writeBuffer(this.uniform, 0, this.data)
     const [x, y, z] = this.daylight.direction
-    if (!waveState.active || !waveState.incoming) this.lighting.encode(encoder, x + y * 7 + z * 49)
+    // The wash reshapes the bed every frame; refresh its lighting a few times a
+    // second so softening prints shade correctly without a solve per frame.
+    if (waveState.justStarted) this.washLitAt = Number.NEGATIVE_INFINITY
+    if (!waveState.active || waveState.time - this.washLitAt >= WASH_LIGHTING_INTERVAL) {
+      this.lighting.encode(encoder, x + y * 7 + z * 49)
+      if (waveState.active) this.washLitAt = waveState.time
+    }
     if (waveState.justStarted) this.airborneShadow.clear(encoder)
     else if (!waveState.active) this.airborneShadow.encode(encoder, this.daylight.direction)
     const pass = encoder.beginRenderPass({ label: 'Sand image', colorAttachments: [

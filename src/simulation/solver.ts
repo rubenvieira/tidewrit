@@ -105,8 +105,11 @@ export class SandSolver {
       entries: [
         { binding: 0, resource: { buffer: this.waveResetUniform } },
         { binding: 1, resource: { buffer } },
-        { binding: 2, resource: { buffer: this.water.moisture[index] } },
-        { binding: 3, resource: { buffer: this.water.packing[index] } },
+        { binding: 2, resource: { buffer: this.buffers[1 - index] } },
+        { binding: 3, resource: { buffer: this.water.moisture[0] } },
+        { binding: 4, resource: { buffer: this.water.moisture[1] } },
+        { binding: 5, resource: { buffer: this.water.packing[0] } },
+        { binding: 6, resource: { buffer: this.water.packing[1] } },
       ],
     }))
     this.reset()
@@ -155,30 +158,22 @@ export class SandSolver {
   }
 
   encodeWaveReset(encoder: GPUCommandEncoder, state: WaveResetState) {
-    const spacing = SAND.extent / this.resolution
-    const halfExtent = SAND.extent * 0.5
-    const shorelineOffsetBound = halfExtent * Math.abs(WAVE_RESET.shorelineTilt)
-      + WAVE_RESET.shorelineAmplitude * (1 + Math.abs(WAVE_RESET.shorelineBlend) + 0.55)
-    const lowerFront = Math.min(state.erasePreviousBaseFront, state.eraseCurrentBaseFront) - shorelineOffsetBound
-    const upperFront = Math.max(state.erasePreviousBaseFront, state.eraseCurrentBaseFront) + shorelineOffsetBound
-    const rowStart = Math.max(0, Math.min(this.resolution, Math.floor((lowerFront + halfExtent) / spacing) - 1))
-    const rowEnd = Math.max(rowStart, Math.min(this.resolution, Math.ceil((upperFront + halfExtent) / spacing) + 1))
-    const rowCount = rowEnd - rowStart
-    if (rowCount <= 0) return
-
+    const settle = 1 - Math.exp(-state.deltaTime / WAVE_RESET.washSettle)
+    const smoothing = Math.min(0.9, 1 - Math.exp(-state.deltaTime / WAVE_RESET.washSmooth))
     const data = new Float32Array([
-      this.resolution, spacing, SAND.extent, SAND.depth,
-      state.erasePreviousBaseFront, state.eraseCurrentBaseFront, state.erasePreviousTime, state.eraseCurrentTime,
-      rowStart, rowCount, 0, 0,
+      this.resolution, SAND.extent / this.resolution, SAND.extent, SAND.depth,
+      state.currentBaseFront, state.time, settle, smoothing,
+      0, 0, state.justFinished ? 1 : 0, 0,
     ])
     this.device.queue.writeBuffer(this.waveResetUniform, 0, data)
-    const pass = encoder.beginComputePass({ label: 'Wave reset' })
+    // The wash reads its neighbours, so it writes the spare state buffer and
+    // copies the result back rather than smoothing in place.
+    const pass = encoder.beginComputePass({ label: 'Wave wash' })
     pass.setPipeline(this.waveResetPipeline)
-    for (const group of this.waveResetGroups) {
-      pass.setBindGroup(0, group)
-      pass.dispatchWorkgroups(Math.ceil(this.resolution / 8), Math.ceil(rowCount / 8))
-    }
+    pass.setBindGroup(0, this.waveResetGroups[this.current])
+    pass.dispatchWorkgroups(Math.ceil(this.resolution / 8), Math.ceil(this.resolution / 8))
     pass.end()
+    encoder.copyBufferToBuffer(this.buffers[1 - this.current], 0, this.buffers[this.current], 0, this.byteLength)
     this.generation++
   }
 
